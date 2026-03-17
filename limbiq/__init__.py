@@ -18,6 +18,9 @@ from limbiq.types import (
     MemoryTier,
     SignalType,
     SuppressionReason,
+    BehavioralRule,
+    KnowledgeCluster,
+    RetrievalConfig,
 )
 
 
@@ -53,7 +56,7 @@ class Limbiq:
         """End session and run compression/cleanup."""
         return self._core.end_session()
 
-    # -- Explicit signals --
+    # -- Explicit signals (Dopamine / GABA) --
 
     def dopamine(self, content: str):
         """Manually tag a piece of information as high-priority."""
@@ -82,6 +85,30 @@ class Limbiq:
             if m.content != correction:
                 self._core.store.suppress(m.id, SuppressionReason.CONTRADICTED)
 
+    # -- Serotonin (behavioral rules) --
+
+    def get_active_rules(self) -> list[BehavioralRule]:
+        """Return all crystallized behavioral rules."""
+        return self._core.rule_store.get_active_rules()
+
+    def deactivate_rule(self, rule_id: str):
+        """Deactivate a behavioral rule (reversible)."""
+        self._core.rule_store.deactivate_rule(rule_id)
+
+    def reactivate_rule(self, rule_id: str):
+        """Reactivate a previously deactivated rule."""
+        self._core.rule_store.reactivate_rule(rule_id)
+
+    # -- Acetylcholine (knowledge clusters) --
+
+    def get_clusters(self) -> list[KnowledgeCluster]:
+        """Return all knowledge clusters."""
+        return self._core.cluster_store.get_all_clusters()
+
+    def get_cluster_memories(self, cluster_id: str) -> list[Memory]:
+        """Return all memories in a cluster."""
+        return self._core.cluster_store.get_cluster_memories(cluster_id)
+
     # -- Inspection --
 
     def get_stats(self) -> dict:
@@ -108,6 +135,25 @@ class Limbiq:
         """Export full state as JSON for debugging."""
         return self._core.store.export_all()
 
+    def get_full_profile(self) -> dict:
+        """Return a complete user profile."""
+        return {
+            "priority_facts": [
+                {"id": m.id, "content": m.content}
+                for m in self.get_priority_memories()
+            ],
+            "behavioral_rules": [
+                {"id": r.id, "rule": r.rule_text, "pattern": r.pattern_key}
+                for r in self.get_active_rules()
+            ],
+            "knowledge_domains": [
+                {"id": c.id, "topic": c.topic, "memory_count": len(c.memory_ids)}
+                for c in self.get_clusters()
+            ],
+            "suppressed_count": len(self.get_suppressed()),
+            "stats": self.get_stats(),
+        }
+
 
 __all__ = [
     "Limbiq",
@@ -117,4 +163,7 @@ __all__ = [
     "MemoryTier",
     "SignalType",
     "SuppressionReason",
+    "BehavioralRule",
+    "KnowledgeCluster",
+    "RetrievalConfig",
 ]
