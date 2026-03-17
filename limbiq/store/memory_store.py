@@ -31,7 +31,7 @@ class MemoryStore:
 
         os.makedirs(store_path, exist_ok=True)
         db_path = os.path.join(store_path, f"{user_id}.db")
-        self.db = sqlite3.connect(db_path)
+        self.db = sqlite3.connect(db_path, check_same_thread=False)
         self._init_tables()
 
     def _init_tables(self):
