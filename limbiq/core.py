@@ -34,7 +34,7 @@ class LimbiqCore:
         self.embeddings = EmbeddingEngine(embedding_model)
         self.compressor = MemoryCompressor(llm_fn)
         self.context_builder = ContextBuilder()
-        self.signal_log = SignalLog(self.store.db)
+        self.signal_log = SignalLog(self.store)
 
         self.signals = [
             DopamineSignal(),

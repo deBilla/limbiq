@@ -1,8 +1,14 @@
-"""SQLite-backed memory store with tiers."""
+"""SQLite-backed memory store with tiers.
+
+Thread-safe: uses threading.local() for per-thread SQLite connections.
+This is required for multi-threaded frameworks like Gradio where handlers
+run in worker threads separate from the main thread.
+"""
 
 import json
 import os
 import sqlite3
+import threading
 import uuid
 import time
 
@@ -28,11 +34,20 @@ class MemoryStore:
     def __init__(self, store_path: str, user_id: str):
         self.store_path = store_path
         self.user_id = user_id
+        self._local = threading.local()
 
         os.makedirs(store_path, exist_ok=True)
-        db_path = os.path.join(store_path, f"{user_id}.db")
-        self.db = sqlite3.connect(db_path, check_same_thread=False)
+        self._db_path = os.path.join(store_path, f"{user_id}.db")
         self._init_tables()
+
+    @property
+    def db(self) -> sqlite3.Connection:
+        """Return a per-thread SQLite connection."""
+        conn = getattr(self._local, 'conn', None)
+        if conn is None:
+            conn = sqlite3.connect(self._db_path)
+            self._local.conn = conn
+        return conn
 
     def _init_tables(self):
         self.db.executescript(
@@ -252,20 +267,24 @@ class MemoryStore:
                 "SELECT COUNT(*) FROM memories WHERE tier = ? AND is_suppressed = 0",
                 (tier.value,),
             )
-            stats[tier.value] = cursor.fetchone()[0]
+            row = cursor.fetchone()
+            stats[tier.value] = row[0] if row else 0
 
         cursor = self.db.execute(
             "SELECT COUNT(*) FROM memories WHERE is_suppressed = 1"
         )
-        stats["suppressed"] = cursor.fetchone()[0]
+        row = cursor.fetchone()
+        stats["suppressed"] = row[0] if row else 0
 
         cursor = self.db.execute(
             "SELECT COUNT(*) FROM memories WHERE is_priority = 1 AND is_suppressed = 0"
         )
-        stats["priority"] = cursor.fetchone()[0]
+        row = cursor.fetchone()
+        stats["priority"] = row[0] if row else 0
 
         cursor = self.db.execute("SELECT COUNT(*) FROM memories")
-        stats["total"] = cursor.fetchone()[0]
+        row = cursor.fetchone()
+        stats["total"] = row[0] if row else 0
 
         return stats
 

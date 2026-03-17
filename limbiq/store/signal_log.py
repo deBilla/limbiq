@@ -1,18 +1,23 @@
-"""Signal event history storage."""
+"""Signal event history storage.
+
+Thread-safe: gets the db connection from the store on each call
+so it uses the per-thread connection via threading.local().
+"""
 
 import json
-import sqlite3
 import uuid
 
 from limbiq.types import SignalEvent
 
 
 class SignalLog:
-    def __init__(self, db: sqlite3.Connection):
-        self.db = db
+    def __init__(self, store):
+        """Accept the MemoryStore (not a raw connection) for thread-safe access."""
+        self._store = store
 
     def log(self, event: SignalEvent) -> None:
-        self.db.execute(
+        db = self._store.db
+        db.execute(
             """INSERT INTO signal_log (id, signal_type, trigger, timestamp, details, memory_ids_affected)
                VALUES (?, ?, ?, ?, ?, ?)""",
             (
@@ -24,10 +29,11 @@ class SignalLog:
                 json.dumps(event.memory_ids_affected),
             ),
         )
-        self.db.commit()
+        db.commit()
 
     def get_recent(self, limit: int = 50) -> list[SignalEvent]:
-        cursor = self.db.execute(
+        db = self._store.db
+        cursor = db.execute(
             "SELECT signal_type, trigger, timestamp, details, memory_ids_affected "
             "FROM signal_log ORDER BY timestamp DESC LIMIT ?",
             (limit,),
