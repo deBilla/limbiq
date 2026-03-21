@@ -186,6 +186,61 @@ class CalculatorTool(BaseTool):
                               error=f"Could not evaluate '{expr}': {e}")
 
 
+# ── WebFetchTool ─────────────────────────────────────────────────────────────
+
+class WebFetchTool(BaseTool):
+    name = "fetch"
+    description = "Fetch a URL and return its text content. Usage: /fetch <url>"
+    MAX_CHARS = 8000
+    TIMEOUT = 15
+
+    def execute(self, args: str) -> ToolResult:
+        url = args.strip()
+        if not url:
+            return ToolResult(name=self.name, output="", success=False, error="No URL provided.")
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+
+        from urllib.request import Request, urlopen
+        from urllib.error import URLError
+        import json
+
+        try:
+            req = Request(url, headers={
+                "User-Agent": "limbiq/0.4 (knowledge agent)",
+                "Accept": "text/html,application/json,text/plain",
+            })
+            with urlopen(req, timeout=self.TIMEOUT) as resp:
+                content_type = resp.headers.get("Content-Type", "")
+                raw = resp.read(self.MAX_CHARS * 2).decode("utf-8", errors="replace")
+
+                # For HTML, strip tags to get readable text
+                if "html" in content_type:
+                    raw = self._strip_html(raw)
+
+                # Truncate
+                if len(raw) > self.MAX_CHARS:
+                    raw = raw[:self.MAX_CHARS] + "\n... (truncated)"
+
+                return ToolResult(name=self.name, output=raw, success=True)
+        except URLError as e:
+            return ToolResult(name=self.name, output="", success=False,
+                              error=f"Could not fetch {url}: {e}")
+        except Exception as e:
+            return ToolResult(name=self.name, output="", success=False, error=str(e))
+
+    @staticmethod
+    def _strip_html(html: str) -> str:
+        """Simple HTML tag stripper — extracts readable text."""
+        # Remove script/style blocks
+        html = re.sub(r'<(script|style)[^>]*>.*?</\1>', '', html, flags=re.DOTALL | re.I)
+        # Remove tags
+        text = re.sub(r'<[^>]+>', ' ', html)
+        # Collapse whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+
+
 # ── ToolRegistry ─────────────────────────────────────────────────────────────
 
 class ToolRegistry:
@@ -193,14 +248,18 @@ class ToolRegistry:
 
     # User-facing command patterns: /tool args
     _COMMAND_RE = re.compile(
-        r"^/(file|run|calc)\s+(.*)", re.IGNORECASE | re.DOTALL
+        r"^/(file|run|calc|fetch)\s+(.*)", re.IGNORECASE | re.DOTALL
     )
+
+    # URL pattern for auto-detection in user messages
+    _URL_RE = re.compile(r'https?://\S+')
 
     # Auto-detect phrases in LLM output → map to tool
     _AUTO_PATTERNS = [
         (re.compile(r"let me (?:read|check|open|look at) (?:the )?file\s+(\S+)", re.I), "file"),
         (re.compile(r"let me (?:run|execute|check)\s+`?([^`\n]+)`?", re.I), "run"),
         (re.compile(r"let me (?:calculate|compute|figure out)\s+([0-9+\-*/().^ \t]+)", re.I), "calc"),
+        (re.compile(r"let me (?:fetch|open|visit|check|read)\s+(?:the\s+)?(?:url|link|page|site)?\s*(https?://\S+)", re.I), "fetch"),
     ]
 
     def __init__(self):
@@ -208,7 +267,7 @@ class ToolRegistry:
         self._register_defaults()
 
     def _register_defaults(self):
-        for t in [FileReaderTool(), TerminalTool(), CalculatorTool()]:
+        for t in [FileReaderTool(), TerminalTool(), CalculatorTool(), WebFetchTool()]:
             self._tools[t.name] = t
 
     def register(self, tool: BaseTool):
@@ -218,10 +277,17 @@ class ToolRegistry:
         return list(self._tools.keys())
 
     def detect_tool_request(self, text: str) -> Optional[Tuple[str, str]]:
-        """Detect explicit /tool command. Returns (tool_name, args) or None."""
+        """Detect explicit /tool command or URL in message. Returns (tool_name, args) or None."""
+        # Check /command first
         m = self._COMMAND_RE.match(text.strip())
         if m:
             return m.group(1).lower(), m.group(2).strip()
+
+        # Auto-detect URLs in user message → fetch tool
+        url_match = self._URL_RE.search(text)
+        if url_match:
+            return "fetch", url_match.group(0)
+
         return None
 
     def detect_auto(self, text: str) -> Optional[Tuple[str, str]]:

@@ -250,9 +250,17 @@ class LimbiqCore:
             self.signal_log.log(event)
             events.append(event)
 
-        # Extract entities and relations from the exchange
+        # When GABA or Dopamine fires (correction/denial), clean the graph too.
+        # Find entity names mentioned in the correction and remove wrong relations.
+        for event in events:
+            if event.signal_type in (SignalType.GABA, SignalType.DOPAMINE):
+                if event.trigger in ("user_correction", "user_denial", "contradicted"):
+                    self._correct_graph(message)
+
+        # Extract entities and relations from USER message only.
+        # LLM responses contain general knowledge (e.g., "Machine Learning",
+        # "consult your vet") that creates junk entities in the user's graph.
         self.entity_extractor.extract_from_memory(message)
-        self.entity_extractor.extract_from_memory(response)
 
         # Only store raw user message as memory when NO signals fired and
         # NO entities were extracted. When dopamine fires or the graph captures
@@ -325,6 +333,47 @@ class LimbiqCore:
 
         return results
 
+    def _correct_graph(self, message: str):
+        """
+        When a correction/denial is detected, find and remove wrong relations
+        from the knowledge graph. Looks for entity names in the message and
+        removes relations between them.
+        """
+        import re
+        # Extract capitalized names from the correction message
+        words = message.split()
+        names = [w.strip(".,!?'\"") for w in words if w[0:1].isupper() and len(w) > 2]
+
+        # Also check for "not X's Y" or "X is not Y" patterns
+        denial_patterns = [
+            r"(\w+)\s+is\s+not\s+(?:my\s+)?(\w+)",
+            r"not\s+(\w+)(?:'s|s)\s+(\w+)",
+            r"(\w+)\s+(?:isn't|isnt)\s+(?:my\s+)?(\w+)",
+        ]
+        for pattern in denial_patterns:
+            match = re.search(pattern, message, re.I)
+            if match:
+                name_a = match.group(1)
+                name_b = match.group(2)
+                # Try to delete relations between these entities
+                self.graph.delete_relations_between(name_a, name_b)
+                # Also remove inferred relations that may have been built from wrong data
+                self.graph.remove_inferred()
+                return
+
+        # Fallback: if we found 2+ entity names, remove relations between them
+        found_entities = []
+        for name in names:
+            ent = self.graph.find_entity_by_name(name)
+            if ent:
+                found_entities.append(ent)
+
+        if len(found_entities) >= 2:
+            self.graph.delete_relations_between(
+                found_entities[0].name, found_entities[1].name
+            )
+            self.graph.remove_inferred()
+
     def _resolve_graph_user_name(self, user_id: str) -> str:
         """
         Resolve the actual user entity name in the graph.
@@ -343,8 +392,21 @@ class LimbiqCore:
                 "WHERE e.entity_type = 'person' AND r.is_inferred = 0 "
                 "GROUP BY e.id ORDER BY rel_count DESC LIMIT 1"
             ).fetchone()
-            if row and row[0] and row[1] >= 2:
+            if row and row[0] and row[1] >= 1:
                 return row[0]
+        except Exception:
+            pass
+
+        # Fallback: check onboarding profile for the real name
+        try:
+            ob_row = self.store.db.execute(
+                "SELECT value FROM agent_profile WHERE key = 'user_name'"
+            ).fetchone()
+            if ob_row and ob_row[0] and ob_row[0] not in ("", "User", "default"):
+                # Ensure entity exists
+                entity = self.graph.find_entity_by_name(ob_row[0])
+                if entity:
+                    return ob_row[0]
         except Exception:
             pass
 
@@ -363,7 +425,7 @@ class LimbiqCore:
                 store=self.store,
                 graph=self.graph,
                 embedding_engine=self.embeddings,
-                user_name=self.user_id,
+                user_name=self._graph_user_name,
                 model_dir=gnn_model_dir,
             )
             if gnn.load_model():

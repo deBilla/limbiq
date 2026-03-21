@@ -87,12 +87,30 @@ class GraphStore:
             CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name COLLATE NOCASE);
         """)
         self.db.commit()
+        self._cleanup_junk_entities()
+
+    def _cleanup_junk_entities(self):
+        """Remove junk entities and their relations on startup."""
+        try:
+            entities = self.db.execute("SELECT id, name FROM entities").fetchall()
+            junk_ids = [eid for eid, name in entities if self._is_junk_name(name)]
+            if junk_ids:
+                placeholders = ",".join("?" * len(junk_ids))
+                self.db.execute(f"DELETE FROM relations WHERE subject_id IN ({placeholders})", junk_ids)
+                self.db.execute(f"DELETE FROM relations WHERE object_id IN ({placeholders})", junk_ids)
+                self.db.execute(f"DELETE FROM entities WHERE id IN ({placeholders})", junk_ids)
+                self.db.commit()
+        except Exception:
+            pass
 
     # ── Entity operations ─────────────────────────────────────
 
     # Entity names that should never be stored — typically LLM extraction artifacts
     _JUNK_NAMES = {"none", "null", "n/a", "unknown", "undefined", "default", "",
-                   "?", "topic", "user", "the user", "assistant", "ai"}
+                   "?", "topic", "user", "the user", "assistant", "ai",
+                   "wife", "husband", "father", "mother", "brother", "sister",
+                   "son", "daughter", "dog", "cat", "pet", "boss", "friend",
+                   "feeding schedule care", "well-being", "feeding schedule"}
 
     # Reject entities with names shorter than 2 chars or that look like numbers/dates
     @staticmethod
@@ -110,11 +128,12 @@ class GraphStore:
             return True
         return False
 
-    def add_entity(self, entity: Entity) -> Entity:
-        """Add entity. If name already exists (case-insensitive), return existing."""
+    def add_entity(self, entity: Entity) -> Optional[Entity]:
+        """Add entity. If name already exists (case-insensitive), return existing.
+        Returns None if entity name is rejected as junk."""
         # Reject junk names from LLM extraction
         if self._is_junk_name(entity.name):
-            return entity  # silently discard
+            return None
 
         existing = self.find_entity_by_name(entity.name)
         if existing:
@@ -191,6 +210,29 @@ class GraphStore:
             "DELETE FROM relations WHERE source_memory_id = ?", (memory_id,)
         )
         self.db.commit()
+
+    def delete_relation(self, subject_name: str, predicate: str, object_name: str):
+        """Delete a specific relation by entity names and predicate."""
+        subj = self.find_entity_by_name(subject_name)
+        obj = self.find_entity_by_name(object_name)
+        if subj and obj:
+            self.db.execute(
+                "DELETE FROM relations WHERE subject_id=? AND predicate=? AND object_id=?",
+                (subj.id, predicate, obj.id),
+            )
+            self.db.commit()
+
+    def delete_relations_between(self, name_a: str, name_b: str):
+        """Delete ALL relations between two entities (both directions)."""
+        ent_a = self.find_entity_by_name(name_a)
+        ent_b = self.find_entity_by_name(name_b)
+        if ent_a and ent_b:
+            self.db.execute(
+                "DELETE FROM relations WHERE "
+                "(subject_id=? AND object_id=?) OR (subject_id=? AND object_id=?)",
+                (ent_a.id, ent_b.id, ent_b.id, ent_a.id),
+            )
+            self.db.commit()
 
     # ── Stats ─────────────────────────────────────────────────
 

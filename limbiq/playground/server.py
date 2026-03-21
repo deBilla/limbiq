@@ -517,6 +517,7 @@ function ChatView() {
           context: res.context,
           tools_used: res.tools_used || [],
           fact_checked: res.fact_checked,
+          hallucination_caught: res.hallucination_caught,
           corrections: res.corrections || [],
           cot_used: res.cot_used,
           model_used: res.model_used,
@@ -567,6 +568,9 @@ function ChatView() {
                   )}
                   {m.meta?.model_used && m.meta.model_used !== 'none' && (
                     <span style={{ color: 'var(--cyan)', opacity: 0.8 }}>({m.meta.model_used})</span>
+                  )}
+                  {m.meta?.hallucination_caught && (
+                    <span style={{ color: 'var(--red)' }}>hallucination caught</span>
                   )}
                   {m.meta?.search_used && (
                     <span style={{ color: 'var(--orange)' }}>
@@ -752,6 +756,132 @@ function TracesView() {
   );
 }
 
+// ─── Memory View ────────────────────────────────────────────
+function MemoryView() {
+  const [tab, setTab] = useState('all');
+  const [data, setData] = useState(null);
+
+  const tabs = {
+    all: { label: 'All Memories', url: '/memories?limit=50' },
+    priority: { label: 'Priority (Dopamine)', url: '/memories/priority' },
+    suppressed: { label: 'Suppressed (GABA)', url: '/memories/suppressed' },
+    signals: { label: 'Signal Log', url: '/signals?limit=50' },
+    rules: { label: 'Rules (Serotonin)', url: '/rules' },
+  };
+
+  useEffect(() => {
+    setData(null);
+    api.get(tabs[tab].url).then(setData).catch(() => {});
+  }, [tab]);
+
+  const tierColor = { short: 'var(--yellow)', mid: 'var(--cyan)', long: 'var(--green)', priority: 'var(--accent)' };
+  const signalColor = { 'SignalType.DOPAMINE': 'var(--accent)', 'SignalType.GABA': 'var(--red)',
+    'SignalType.SEROTONIN': 'var(--green)', 'SignalType.ACETYLCHOLINE': 'var(--cyan)',
+    'SignalType.NOREPINEPHRINE': 'var(--yellow)', 'dopamine': 'var(--accent)', 'gaba': 'var(--red)' };
+
+  return (
+    <>
+      <div className="tab-bar">
+        {Object.entries(tabs).map(([key, t]) => (
+          <button key={key} className={tab === key ? 'primary' : 'secondary'} onClick={() => setTab(key)}>
+            {t.label} {data && tab === key ? `(${data.count})` : ''}
+          </button>
+        ))}
+      </div>
+
+      {!data && <div style={{ color: 'var(--text-dim)', padding: 20 }}>Loading...</div>}
+
+      {data && tab === 'all' && (
+        <div className="card">
+          <h2>Memories ({data.count})</h2>
+          {data.memories?.map((m, i) => (
+            <div key={i} style={{ padding: '8px 0', borderBottom: '1px solid var(--border)', fontSize: 13 }}>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 4 }}>
+                <span style={{ color: tierColor[m.tier] || 'var(--text-dim)', fontSize: 11, fontWeight: 600, textTransform: 'uppercase' }}>
+                  {m.tier}
+                </span>
+                {m.is_priority && <span style={{ color: 'var(--accent)', fontSize: 11 }}>PRIORITY</span>}
+                {m.is_suppressed && <span style={{ color: 'var(--red)', fontSize: 11 }}>SUPPRESSED</span>}
+                <span style={{ color: 'var(--text-dim)', fontSize: 11, marginLeft: 'auto' }}>
+                  {(m.confidence * 100).toFixed(0)}% · {m.access_count} accesses · {m.source}
+                </span>
+              </div>
+              <div style={{ color: 'var(--text)' }}>{m.content}</div>
+            </div>
+          ))}
+          {data.memories?.length === 0 && <p style={{ color: 'var(--text-dim)' }}>No memories stored yet.</p>}
+        </div>
+      )}
+
+      {data && tab === 'priority' && (
+        <div className="card">
+          <h2>Priority Memories ({data.count})</h2>
+          {data.memories?.map((m, i) => (
+            <div key={i} style={{ padding: '8px 0', borderBottom: '1px solid var(--border)', fontSize: 13 }}>
+              <div style={{ color: 'var(--accent)', fontWeight: 500 }}>{m.content}</div>
+              <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 2 }}>
+                {(m.confidence * 100).toFixed(0)}% · {m.source}
+              </div>
+            </div>
+          ))}
+          {data.memories?.length === 0 && <p style={{ color: 'var(--text-dim)' }}>No priority memories. Use lq.dopamine() or tell the agent important facts.</p>}
+        </div>
+      )}
+
+      {data && tab === 'suppressed' && (
+        <div className="card">
+          <h2>Suppressed Memories ({data.count})</h2>
+          {data.memories?.map((m, i) => (
+            <div key={i} style={{ padding: '8px 0', borderBottom: '1px solid var(--border)', fontSize: 13 }}>
+              <div style={{ color: 'var(--red)', textDecoration: 'line-through' }}>{m.content}</div>
+              <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 2 }}>
+                Reason: {m.suppression_reason || 'unknown'}
+              </div>
+            </div>
+          ))}
+          {data.memories?.length === 0 && <p style={{ color: 'var(--text-dim)' }}>No suppressed memories.</p>}
+        </div>
+      )}
+
+      {data && tab === 'signals' && (
+        <div className="card">
+          <h2>Signal Log ({data.count})</h2>
+          {data.signals?.map((s, i) => (
+            <div key={i} style={{ padding: '6px 0', borderBottom: '1px solid var(--border)', fontSize: 13 }}>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <span style={{ color: signalColor[s.signal_type] || 'var(--text-dim)', fontWeight: 600, fontSize: 12 }}>
+                  {s.signal_type.replace('SignalType.', '')}
+                </span>
+                <span style={{ color: 'var(--text)' }}>{s.trigger}</span>
+                <span style={{ color: 'var(--text-dim)', fontSize: 11, marginLeft: 'auto' }}>
+                  {new Date(s.timestamp * 1000).toLocaleTimeString()}
+                </span>
+              </div>
+            </div>
+          ))}
+          {data.signals?.length === 0 && <p style={{ color: 'var(--text-dim)' }}>No signals fired yet.</p>}
+        </div>
+      )}
+
+      {data && tab === 'rules' && (
+        <div className="card">
+          <h2>Behavioral Rules ({data.count})</h2>
+          {data.rules?.map((r, i) => (
+            <div key={i} style={{ padding: '8px 0', borderBottom: '1px solid var(--border)', fontSize: 13 }}>
+              <div style={{ color: 'var(--green)', fontWeight: 500 }}>{r.rule_text}</div>
+              <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 2 }}>
+                Pattern: {r.pattern_key} · {r.observation_count} observations · {(r.confidence * 100).toFixed(0)}%
+                {!r.is_active && <span style={{ color: 'var(--red)' }}> (inactive)</span>}
+              </div>
+            </div>
+          ))}
+          {data.rules?.length === 0 && <p style={{ color: 'var(--text-dim)' }}>No rules crystallized yet. Rules form after 3+ observations across 2+ sessions.</p>}
+        </div>
+      )}
+    </>
+  );
+}
+
 // ─── App ─────────────────────────────────────────────────────
 function App() {
   const [view, setView] = useState('chat');
@@ -761,6 +891,7 @@ function App() {
 
   const views = {
     chat: () => <ChatView />,
+    memory: () => <MemoryView />,
     dashboard: () => <DashboardView />,
     graph: () => <GraphVisualizer onEntityClick={handleEntityClick} />,
     entities: () => <EntityExplorer initialEntity={selectedEntity} />,
@@ -778,12 +909,13 @@ function App() {
       <div className="sidebar">
         {[
           ['chat', '◉ Chat'],
-          ['dashboard', '◎ Dashboard'],
-          ['graph', '◈ Knowledge Graph'],
-          ['entities', '◇ Entity Explorer'],
-          ['relations', '▷ Relations'],
-          ['query', '⊡ Query Builder'],
-          ['traces', '⊞ Traces'],
+          ['memory', '◎ Memory'],
+          ['dashboard', '◈ Dashboard'],
+          ['graph', '◇ Knowledge Graph'],
+          ['entities', '▷ Entity Explorer'],
+          ['relations', '⊡ Relations'],
+          ['query', '⊞ Query Builder'],
+          ['traces', '⊕ Traces'],
         ].map(([key, label]) => (
           <button key={key} className={view === key ? 'active' : ''}
                   onClick={() => { setView(key); if (key !== 'entities') setSelectedEntity(null); }}>

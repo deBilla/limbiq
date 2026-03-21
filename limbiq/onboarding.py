@@ -44,15 +44,16 @@ class OnboardingManager:
         self._store.db.commit()
 
         # Seed defaults if table is brand-new
-        self._store.db.execute(
-            "INSERT OR IGNORE INTO agent_profile (key, value) VALUES ('agent_name', 'Limbiq')"
-        )
-        self._store.db.execute(
-            "INSERT OR IGNORE INTO agent_profile (key, value) VALUES ('user_name', '')"
-        )
-        self._store.db.execute(
-            "INSERT OR IGNORE INTO agent_profile (key, value) VALUES ('onboarding_complete', '0')"
-        )
+        for key, val in [
+            ("agent_name", "Limbiq"),
+            ("user_name", ""),
+            ("onboarding_complete", "0"),
+            ("onboarding_step", "0"),
+        ]:
+            self._store.db.execute(
+                "INSERT OR IGNORE INTO agent_profile (key, value) VALUES (?, ?)",
+                (key, val),
+            )
         self._store.db.commit()
 
     # ── Internal helpers ─────────────────────────────────────────────
@@ -90,9 +91,27 @@ class OnboardingManager:
         self._set("agent_name", name.strip())
         logger.info(f"Onboarding: agent_name set to {name!r}")
 
+    def get_step(self) -> int:
+        try:
+            return int(self._get("onboarding_step") or "0")
+        except ValueError:
+            return 0
+
+    def set_step(self, step: int):
+        self._set("onboarding_step", str(step))
+
     def complete(self):
         self._set("onboarding_complete", "1")
+        self._set("onboarding_step", "3")
         logger.info("Onboarding: marked complete")
+
+    def reset(self):
+        """Reset onboarding to start fresh."""
+        self._set("user_name", "")
+        self._set("agent_name", "Limbiq")
+        self._set("onboarding_complete", "0")
+        self._set("onboarding_step", "0")
+        logger.info("Onboarding: reset")
 
     def get_greeting(self) -> str:
         profile = self.get_profile()

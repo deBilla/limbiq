@@ -31,10 +31,13 @@ from limbiq.search import SearchClient, SearchResult
 from limbiq.onboarding import OnboardingManager, AgentProfile
 from limbiq.tools import (
     ToolRegistry, BaseTool, ToolResult,
-    FileReaderTool, TerminalTool, CalculatorTool,
+    FileReaderTool, TerminalTool, CalculatorTool, WebFetchTool,
     format_tool_results,
 )
 from limbiq.model_router import ModelRouter
+from limbiq.hallucination import HallucinationDetector, GroundingAnalyzer, FactVerifier
+from limbiq.hallucination.grounding import GroundingReport, GroundingLevel
+from limbiq.hallucination.verifier import VerificationReport, ClaimStatus
 
 
 class Limbiq:
@@ -272,6 +275,16 @@ class Limbiq:
         """Return all relations in the knowledge graph."""
         return self._core.graph.get_all_relations(include_inferred)
 
+    def delete_relation(self, subject_name: str, predicate: str, object_name: str):
+        """Delete a specific relation from the knowledge graph."""
+        self._core.graph.delete_relation(subject_name, predicate, object_name)
+        self._core.graph.remove_inferred()  # Re-clean inferred relations
+
+    def delete_relations_between(self, name_a: str, name_b: str):
+        """Delete ALL relations between two entities."""
+        self._core.graph.delete_relations_between(name_a, name_b)
+        self._core.graph.remove_inferred()
+
     def query_graph(self, question: str) -> dict:
         """Query the knowledge graph with a natural language question."""
         return self._core.graph_query.try_answer(question)
@@ -283,6 +296,35 @@ class Limbiq:
     def get_world_summary(self) -> str:
         """Get a compact summary of everything known about the user."""
         return self._core.inference_engine.get_user_world(self._core._graph_user_name)
+
+    # -- Hallucination Detection --
+
+    def get_hallucination_detector(self) -> "HallucinationDetector":
+        """
+        Get the hallucination detector for this instance.
+
+        Usage in an engine:
+            detector = lq.get_hallucination_detector()
+
+            # Before LLM generation:
+            grounding = detector.pre_generate(query, graph_result, ...)
+
+            # After LLM generation:
+            verification = detector.post_generate(response, user_name, query)
+
+            # Check if regeneration needed:
+            if detector.should_regenerate(verification):
+                correction = detector.correction_prompt(verification, query)
+                # ... regenerate with correction ...
+        """
+        if not hasattr(self, '_hallucination_detector'):
+            self._hallucination_detector = HallucinationDetector(
+                graph_store=self._core.graph,
+                memory_store=self._core.store,
+                embedding_engine=self._core.embeddings,
+                signal_log=self._core.signal_log,
+            )
+        return self._hallucination_detector
 
     # -- Inspection --
 
@@ -362,4 +404,12 @@ __all__ = [
     "format_tool_results",
     # Model routing
     "ModelRouter",
+    # Hallucination detection
+    "HallucinationDetector",
+    "GroundingAnalyzer",
+    "FactVerifier",
+    "GroundingReport",
+    "GroundingLevel",
+    "VerificationReport",
+    "ClaimStatus",
 ]

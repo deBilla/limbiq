@@ -165,28 +165,9 @@ async def get_greeting(request: Request):
         world = ""
         facts_known = 0
 
-    # Build greeting
-    effective_llm = None
-    if model_router:
-        effective_llm = model_router.route("greeting", None, [])
-    elif llm:
-        effective_llm = llm
-
-    if effective_llm and world:
-        try:
-            prompt_msgs = [
-                {"role": "system", "content":
-                    f"You are {agent_name}, a helpful assistant. "
-                    "Generate a short, warm, 1-sentence greeting for the user, "
-                    "referencing one interesting thing you remember about them. "
-                    "Be natural and brief. Do NOT use markdown."},
-                {"role": "user", "content": f"Known facts: {world[:300]}"},
-            ]
-            greeting = effective_llm.chat(prompt_msgs)
-        except Exception:
-            greeting = _template_greeting(agent_name, user_name, world)
-    else:
-        greeting = _template_greeting(agent_name, user_name, world)
+    # Build greeting from template only — never use LLM for greetings
+    # because small quantized models hallucinate fabricated experiences
+    greeting = _template_greeting(agent_name, user_name, world)
 
     return {"greeting": greeting, "facts_known": facts_known}
 
@@ -195,8 +176,11 @@ def _template_greeting(agent_name: str, user_name: str, world: str) -> str:
     name_part = f"Hi {user_name}!" if user_name else "Hi!"
     agent_part = f"I'm {agent_name}."
     if world:
-        first_fact = world.split(".")[0].strip()
-        return f"{name_part} {agent_part} I remember that {first_fact.lower()}."
+        # Find a complete, clean fact (no "?" or broken data)
+        for sentence in world.split("."):
+            fact = sentence.strip()
+            if fact and "?" not in fact and len(fact) > 10:
+                return f"{name_part} {agent_part} I remember that {fact[0].lower()}{fact[1:]}."
     return f"{name_part} {agent_part} How can I help you today?"
 
 
@@ -290,74 +274,97 @@ async def chat(body: QueryRequest, request: Request):
     history = request.app.state.chat_history
 
     # ── Onboarding flow ───────────────────────────────────────────────────────
+    def _looks_like_name(text: str) -> bool:
+        """Check if text is a plausible name (1-3 short words, no sentences)."""
+        words = text.strip().split()
+        return 1 <= len(words) <= 3 and len(text) <= 40
+
+    def _onboarding_response(**overrides):
+        """Build a minimal onboarding response dict."""
+        base = {
+            "llm_used": False, "search_used": False, "search_results_count": 0,
+            "graph_answered": False, "graph_answer": "", "graph_confidence": 0,
+            "reason_answer": "", "reason_confidence": 0,
+            "context": "", "memories_retrieved": 0, "signals_fired": [],
+            "stored": False, "duration_ms": 0,
+            "tools_used": [], "fact_checked": False, "corrections": [],
+            "cot_used": False, "model_used": "none", "hallucination_caught": False,
+        }
+        base.update(overrides)
+        return base
+
     if onboarding_mgr and not onboarding_mgr.is_complete():
-        step = getattr(request.app.state, "onboarding_step", 0)
+        step = onboarding_mgr.get_step()  # Persisted in DB, survives refresh
         user_message = body.message.strip()
 
         if step == 0:
-            # First message: ask for user name
-            request.app.state.onboarding_step = 1
-            return {
-                "message": user_message,
-                "response": "Hi! I'm Limbiq. Before we start, what's your name?",
-                "llm_used": False, "search_used": False, "search_results_count": 0,
-                "graph_answered": False, "graph_answer": "", "graph_confidence": 0,
-                "reason_answer": "", "reason_confidence": 0,
-                "context": "", "memories_retrieved": 0, "signals_fired": [],
-                "stored": False, "duration_ms": 0,
-                "tools_used": [], "fact_checked": False, "corrections": [],
-                "cot_used": False, "model_used": "none",
-            }
+            onboarding_mgr.set_step(1)
+            return _onboarding_response(
+                message=user_message,
+                response="Hi! I'm Limbiq. Before we start, what's your name?",
+            )
 
         if step == 1:
-            # Store user name, ask for agent name
-            # Guard: if empty or looks like a system message, re-ask
-            if not user_message or user_message.startswith("__") or len(user_message) < 2:
-                return {
-                    "message": user_message,
-                    "response": "What's your name? Just type it and I'll remember it.",
-                    "llm_used": False, "search_used": False, "search_results_count": 0,
-                    "graph_answered": False, "graph_answer": "", "graph_confidence": 0,
-                    "reason_answer": "", "reason_confidence": 0,
-                    "context": "", "memories_retrieved": 0, "signals_fired": [],
-                    "stored": False, "duration_ms": 0,
-                    "tools_used": [], "fact_checked": False, "corrections": [],
-                    "cot_used": False, "model_used": "none",
-                }
+            if not _looks_like_name(user_message):
+                # Not a name — re-ask nicely
+                return _onboarding_response(
+                    message=user_message,
+                    response="I'd love to know your name! Just type your first name.",
+                )
             onboarding_mgr.set_user_name(user_message)
-            request.app.state.onboarding_step = 2
-            return {
-                "message": user_message,
-                "response": f"Nice to meet you, {user_message}! What would you like to call me?",
-                "llm_used": False, "search_used": False, "search_results_count": 0,
-                "graph_answered": False, "graph_answer": "", "graph_confidence": 0,
-                "reason_answer": "", "reason_confidence": 0,
-                "context": "", "memories_retrieved": 0, "signals_fired": [],
-                "stored": False, "duration_ms": 0,
-                "tools_used": [], "fact_checked": False, "corrections": [],
-                "cot_used": False, "model_used": "none",
-            }
+            onboarding_mgr.set_step(2)
+
+            # Update the graph with the real user name
+            try:
+                core = lq._core
+                capitalized_name = user_message.strip().capitalize()
+                # Create user entity with real name
+                from limbiq.graph.store import Entity
+                user_entity = core.graph.add_entity(
+                    Entity(name=capitalized_name, entity_type="person")
+                )
+                # Verify entity was actually created (not silently rejected)
+                found = core.graph.find_entity_by_name(capitalized_name)
+                if found:
+                    # Update entity extractor to use real name
+                    core.entity_extractor.user_name = capitalized_name
+                    core.entity_extractor.user_entity = found
+                    # Update graph query and inference
+                    core._graph_user_name = capitalized_name
+                    core.graph_query.user_name = capitalized_name
+                    # Update inference engine reference
+                    core.inference_engine._user_name_cache = None
+                    logger.info(f"Graph user entity updated: {capitalized_name}")
+                else:
+                    logger.warning(f"User entity '{capitalized_name}' was rejected by graph store")
+
+                # Store as dopamine priority memory
+                lq.dopamine(f"User's name is {capitalized_name}")
+            except Exception as e:
+                logger.warning(f"Failed to update graph with user name: {e}")
+
+            return _onboarding_response(
+                message=user_message,
+                response=f"Nice to meet you, {user_message}! What would you like to call me?",
+            )
 
         if step == 2:
-            # Store agent name, complete onboarding
+            if not _looks_like_name(user_message):
+                # Not a name — re-ask nicely
+                return _onboarding_response(
+                    message=user_message,
+                    response="Pick a short name for me! Something like Jim, Nova, or Atlas.",
+                )
             onboarding_mgr.set_agent_name(user_message)
             onboarding_mgr.complete()
-            request.app.state.onboarding_step = 3
             profile = onboarding_mgr.get_profile()
-            return {
-                "message": user_message,
-                "response": (
+            return _onboarding_response(
+                message=user_message,
+                response=(
                     f"Perfect! I'm {profile.agent_name} and I'll remember that name. "
                     f"Now, {profile.user_name}, what's on your mind?"
                 ),
-                "llm_used": False, "search_used": False, "search_results_count": 0,
-                "graph_answered": False, "graph_answer": "", "graph_confidence": 0,
-                "reason_answer": "", "reason_confidence": 0,
-                "context": "", "memories_retrieved": 0, "signals_fired": [],
-                "stored": False, "duration_ms": 0,
-                "tools_used": [], "fact_checked": False, "corrections": [],
-                "cot_used": False, "model_used": "none",
-            }
+            )
 
     # ── Normal chat flow ──────────────────────────────────────────────────────
     with tracer.start_as_current_span("api.chat") as span:
@@ -424,26 +431,44 @@ async def chat(body: QueryRequest, request: Request):
                 persona_parts.append(f"You were named by {profile.user_name}.")
         persona_str = " ".join(persona_parts)
 
+        no_info = ("say you don't know and offer to search for it." if search_connected
+                   else "say you don't have that information yet.")
+
+        # Build tool description for system prompt
+        tool_desc = ""
+        if tool_registry:
+            tools = tool_registry.list_tools()
+            if tools:
+                tool_desc = (
+                    "\nYou have access to tools. URLs shared by the user are automatically fetched. "
+                    "Available commands: " + ", ".join(f"/{t}" for t in tools) + ". "
+                    "When results are provided in [TOOL RESULT], use them to answer the question."
+                )
+
         system_parts = [
             (f"{persona_str} " if persona_str else "") +
-            "You are a helpful, honest assistant with access to stored facts about the user.\n\n"
-            "IMPORTANT RULES:\n"
-            "1. Use the facts provided below to answer naturally — as if you simply remember them. "
-            "NEVER quote tag names, section headers, or raw memory text in your response. "
-            "Do NOT say things like '[KNOWN FACT]', '<memory_context>', 'User said:', or 'according to my memory'. "
-            "Just answer naturally.\n"
-            "2. ONLY state facts that are provided below. If something is not in the provided facts, "
-            + ("say you don't know and offer to search for it.\n" if search_connected else
-               "say you don't have that information yet and ask the user to tell you.\n") +
-            "3. NEVER invent or guess facts about the user, their relationships, or their life.\n"
-            "4. NEVER describe how your memory or architecture works.\n"
-            "5. Ignore any memories that start with 'User said:' or 'User asked:' — those are past "
-            "questions, NOT facts. Only use memories that state actual information.\n"
-            "6. Be concise, warm, and natural."
+            "You are a helpful, honest assistant.\n"
+            "RULES:\n"
+            "- Use ONLY the facts below and the conversation history. Refer back to recent messages when relevant.\n"
+            "- If a fact is NOT in the provided context or conversation history, DO NOT mention it. "
+            f"Instead, {no_info}\n"
+            "- NEVER make up events, trips, experiences, or stories. NEVER add fictional details.\n"
+            "- Never quote tags like [KNOWN FACT] or <memory_context>. Be concise and warm."
+            + tool_desc
         ]
 
         if process_result.context:
             system_parts.append(process_result.context)
+
+        # Inject world summary directly if not already in context
+        # (handles case where graph user name was just updated by onboarding)
+        try:
+            world = lq.get_world_summary()
+            if world and "[ABOUT YOU]" not in (process_result.context or ""):
+                system_parts.append(f"[ABOUT YOU] {world}")
+        except Exception:
+            pass
+
         if graph_answered:
             system_parts.append(f"\n[Graph knowledge — verified fact]: {graph_answer}")
         if reason_answer:
@@ -497,10 +522,17 @@ async def chat(body: QueryRequest, request: Request):
                         clean = line.lstrip("- ").strip()
                         if clean.startswith("[") and "] " in clean:
                             clean = clean.split("] ", 1)[1]
+                        # Skip raw user messages and duplicates
+                        if clean.startswith("User said:") or clean.startswith("User asked:"):
+                            continue
+                        if clean.startswith("So my wife") or len(clean) > 150:
+                            continue  # Skip long raw conversation dumps
                         lines.append(clean)
+                # Deduplicate
+                lines = list(dict.fromkeys(lines))
                 if lines:
                     response_text = "Here's what I know:\n" + "\n".join(
-                        f"• {l}" for l in lines
+                        f"• {l}" for l in lines[:5]
                     )
                 else:
                     response_text = "I have some memories but couldn't find a specific answer."
@@ -542,7 +574,7 @@ async def chat(body: QueryRequest, request: Request):
 
             logger.info(f"Search check: needs_search={needs_search}, uncertainty={detect_uncertainty(response_text)}, force={force_search}")
 
-            if needs_search:
+            if needs_search and user_message.strip():
                 logger.info(f"Searching for: {user_message}")
                 try:
                     search_results = search_client(user_message)
@@ -581,6 +613,67 @@ async def chat(body: QueryRequest, request: Request):
                     response_text = response_text + "\n\n" + " ".join(corrections)
             except Exception as e:
                 logger.warning(f"Fact-check failed: {e}")
+
+        # ── Hallucination detection + regeneration ─────────────────────────────
+        hallucination_caught = False
+        if llm_used and response_text:
+            try:
+                detector = lq.get_hallucination_detector()
+                user_name = ""
+                if onboarding_mgr:
+                    p = onboarding_mgr.get_profile()
+                    user_name = p.user_name or ""
+
+                # Pre-generate grounding analysis
+                grounding = detector.pre_generate(
+                    query=user_message,
+                    graph_result=graph_result,
+                    memories_retrieved=process_result.memories_retrieved,
+                    memory_context=process_result.context,
+                )
+
+                # Post-generate verification (pass conversation history to avoid false positives)
+                verification = detector.post_generate(
+                    response=response_text,
+                    user_entity_name=user_name or "user",
+                    query=user_message,
+                    conversation_history=history[-12:],
+                )
+
+                # Log verification results
+                logger.info(
+                    f"Hallucination check: score={verification.hallucination_score:.2f}, "
+                    f"claims={len(verification.claims)}, verified={verification.verified_count}, "
+                    f"contradicted={verification.contradicted_count}, unverified={verification.unverified_count}, "
+                    f"grounding={grounding.level.value}"
+                )
+                for c in verification.claims:
+                    logger.info(f"  Claim: [{c.status.value}] {c.predicate}: {c.text[:80]}")
+
+                # Regenerate if hallucination detected
+                if detector.should_regenerate(verification, grounding):
+                    hallucination_caught = True
+                    logger.warning(f"Hallucination detected (score={verification.hallucination_score:.2f}), regenerating...")
+
+                    correction = detector.correction_prompt(
+                        verification, user_message, process_result.context
+                    )
+                    # Include conversation history so regeneration has context
+                    retry_msgs = [
+                        {"role": "system", "content": "\n\n".join(system_parts) + "\n\n" + correction},
+                    ]
+                    retry_msgs.extend(history[-12:])
+                    retry_msgs.append({"role": "user", "content": user_message})
+                    try:
+                        response_text = llm.chat(retry_msgs)
+                    except Exception:
+                        pass  # Keep original on retry failure
+
+                    detector.record(user_message, response_text, grounding, verification, "regenerated")
+                else:
+                    detector.record(user_message, response_text, grounding, verification, "accepted")
+            except Exception as e:
+                logger.warning(f"Hallucination check failed: {e}")
 
         # ── Update conversation history ────────────────────────────────────────
         history.append({"role": "user", "content": user_message})
@@ -638,6 +731,7 @@ async def chat(body: QueryRequest, request: Request):
             "corrections": corrections,
             "cot_used": cot_used,
             "model_used": model_used,
+            "hallucination_caught": hallucination_caught,
         }
 
 
@@ -850,6 +944,97 @@ async def describe_entity(name: str, request: Request):
     }
 
 
+# ── Memory Views ──────────────────────────────────────────────────────────────
+
+@router.get("/memories")
+async def get_memories(request: Request, tier: str = Query(None), limit: int = Query(50)):
+    """Return stored memories, optionally filtered by tier."""
+    lq = _get_lq(request)
+    db = lq._core.store.db
+    query = "SELECT id, content, tier, confidence, created_at, access_count, is_priority, is_suppressed, source FROM memories"
+    params = []
+    if tier:
+        query += " WHERE tier = ?"
+        params.append(tier)
+    query += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    rows = db.execute(query, params).fetchall()
+    return {
+        "memories": [
+            {
+                "id": r[0], "content": r[1], "tier": r[2], "confidence": r[3],
+                "created_at": r[4], "access_count": r[5], "is_priority": bool(r[6]),
+                "is_suppressed": bool(r[7]), "source": r[8],
+            }
+            for r in rows
+        ],
+        "count": len(rows),
+    }
+
+
+@router.get("/memories/priority")
+async def get_priority_memories(request: Request):
+    """Return all dopamine-tagged priority memories."""
+    lq = _get_lq(request)
+    memories = lq.get_priority_memories()
+    return {
+        "memories": [
+            {"id": m.id, "content": m.content, "confidence": m.confidence, "source": m.source}
+            for m in memories
+        ],
+        "count": len(memories),
+    }
+
+
+@router.get("/memories/suppressed")
+async def get_suppressed_memories(request: Request):
+    """Return all GABA-suppressed memories."""
+    lq = _get_lq(request)
+    memories = lq.get_suppressed()
+    return {
+        "memories": [
+            {"id": m.id, "content": m.content, "suppression_reason": m.suppression_reason}
+            for m in memories
+        ],
+        "count": len(memories),
+    }
+
+
+@router.get("/signals")
+async def get_signals(request: Request, limit: int = Query(50)):
+    """Return recent signal events."""
+    lq = _get_lq(request)
+    events = lq.get_signal_log(limit)
+    return {
+        "signals": [
+            {
+                "signal_type": str(e.signal_type),
+                "trigger": e.trigger,
+                "timestamp": e.timestamp,
+                "details": e.details if hasattr(e, 'details') else {},
+            }
+            for e in events
+        ],
+        "count": len(events),
+    }
+
+
+@router.get("/rules")
+async def get_rules(request: Request):
+    """Return active behavioral rules (serotonin)."""
+    lq = _get_lq(request)
+    rules = lq.get_active_rules()
+    return {
+        "rules": [
+            {"id": r.id, "pattern_key": r.pattern_key, "rule_text": r.rule_text,
+             "confidence": r.confidence, "observation_count": r.observation_count,
+             "is_active": r.is_active}
+            for r in rules
+        ],
+        "count": len(rules),
+    }
+
+
 # ── Stats & Profile ────────────────────────────────────────────────────────────
 
 @router.get("/stats", response_model=StatsResponse)
@@ -895,6 +1080,27 @@ async def get_profile(request: Request):
         "relation_count": len(rels),
         "priority_facts": priority_facts,
     }
+
+
+# ── Graph Corrections ──────────────────────────────────────────────────────────
+
+@router.post("/graph/delete-relation")
+async def delete_relation(request: Request):
+    """Delete a specific relation from the knowledge graph."""
+    lq = _get_lq(request)
+    body = await request.json()
+    subject = body.get("subject", "")
+    predicate = body.get("predicate", "")
+    obj = body.get("object", "")
+
+    if subject and predicate and obj:
+        lq.delete_relation(subject, predicate, obj)
+        return {"status": "ok", "deleted": f"{subject} → {predicate} → {obj}"}
+    elif subject and obj:
+        lq.delete_relations_between(subject, obj)
+        return {"status": "ok", "deleted": f"all relations between {subject} and {obj}"}
+    else:
+        raise HTTPException(status_code=400, detail="Provide subject + predicate + object, or subject + object")
 
 
 # ── Operations ─────────────────────────────────────────────────────────────────
@@ -984,3 +1190,91 @@ async def get_telemetry_metrics(
     if not met:
         return {"data": [], "message": "Metrics not initialized"}
     return {"data": met.get_time_series(since, metric_type)}
+
+
+# ── Hallucination Detection ───────────────────────────────────────────────────
+
+@router.post("/hallucination/check")
+async def check_hallucination(request: Request, body: QueryRequest):
+    """
+    Run hallucination detection on a query + response pair.
+    Useful for testing: provide a message, get grounding + verification.
+    """
+    lq = request.app.state.limbiq
+
+    # Get the hallucination detector
+    detector = lq.get_hallucination_detector()
+    user_name = lq._core._graph_user_name
+
+    # Pre-generation grounding
+    graph_result = lq.query_graph(body.message)
+    result = lq.process(body.message)
+
+    grounding = detector.pre_generate(
+        query=body.message,
+        graph_result=graph_result if graph_result.get("answered") else None,
+        memories_retrieved=result.memories_retrieved,
+        memory_context=result.context,
+        world_summary=lq.get_world_summary(),
+    )
+
+    return {
+        "grounding": {
+            "level": grounding.level.value,
+            "query_type": grounding.query_type,
+            "graph_has_answer": grounding.graph_has_answer,
+            "memory_relevance_score": grounding.memory_relevance_score,
+            "relevant_fact_count": grounding.relevant_fact_count,
+            "known_entities": grounding.known_entities_mentioned,
+            "constraint_prompt": grounding.constraint_prompt,
+            "suggested_temperature": grounding.suggested_temperature,
+        },
+    }
+
+
+@router.post("/hallucination/verify")
+async def verify_response(request: Request, body: ObserveRequest):
+    """
+    Verify an LLM response for hallucinated facts.
+    body.message = original query, body.response = LLM response to verify.
+    """
+    lq = request.app.state.limbiq
+    detector = lq.get_hallucination_detector()
+    user_name = lq._core._graph_user_name
+
+    verification = detector.post_generate(
+        response=body.response,
+        user_entity_name=user_name,
+        query=body.message,
+    )
+
+    return {
+        "claims": [
+            {
+                "text": c.text,
+                "subject": c.subject,
+                "predicate": c.predicate,
+                "object_value": c.object_value,
+                "status": c.status.value,
+                "evidence": c.evidence,
+                "confidence": c.confidence,
+            }
+            for c in verification.claims
+        ],
+        "verified_count": verification.verified_count,
+        "unverified_count": verification.unverified_count,
+        "contradicted_count": verification.contradicted_count,
+        "hallucination_score": verification.hallucination_score,
+        "flagged_text": verification.flagged_text,
+    }
+
+
+@router.get("/hallucination/stats")
+async def get_hallucination_stats(request: Request):
+    """Return hallucination detection statistics."""
+    lq = request.app.state.limbiq
+    detector = lq.get_hallucination_detector()
+    return {
+        "stats": detector.get_stats(),
+        "recent_events": detector.get_recent_events(20),
+    }

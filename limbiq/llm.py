@@ -40,7 +40,7 @@ class LLMClient:
         temperature: float = 0.3,
         max_tokens: int = 1024,
         system_prompt: Optional[str] = None,
-        timeout: int = 60,
+        timeout: int = 120,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -87,21 +87,30 @@ class LLMClient:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
         data = json.dumps(payload).encode("utf-8")
-        req = Request(url, data=data, headers=headers, method="POST")
 
-        try:
-            with urlopen(req, timeout=self.timeout) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-                return body["choices"][0]["message"]["content"]
-        except URLError as e:
-            logger.error(f"LLM request failed: {e}")
-            raise ConnectionError(
-                f"Could not connect to LLM at {url}. "
-                f"Is the server running? Error: {e}"
-            ) from e
-        except (KeyError, IndexError) as e:
-            logger.error(f"Unexpected LLM response format: {e}")
-            raise ValueError(f"Unexpected response from LLM: {e}") from e
+        # Retry up to 3 times with exponential backoff — Ollama returns
+        # 404 when busy processing another request (single-request mode)
+        import time as _time
+        for attempt in range(3):
+            try:
+                req = Request(url, data=data, headers=headers, method="POST")
+                with urlopen(req, timeout=self.timeout) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+                    return body["choices"][0]["message"]["content"]
+            except URLError as e:
+                if attempt < 2:
+                    wait = (attempt + 1) * 2  # 2s, 4s
+                    logger.info(f"LLM busy, retrying in {wait}s (attempt {attempt + 1}/3)")
+                    _time.sleep(wait)
+                    continue
+                logger.error(f"LLM request failed after 3 attempts: {e}")
+                raise ConnectionError(
+                    f"Could not connect to LLM at {url}. "
+                    f"Is the server running? Error: {e}"
+                ) from e
+            except (KeyError, IndexError) as e:
+                logger.error(f"Unexpected LLM response format: {e}")
+                raise ValueError(f"Unexpected response from LLM: {e}") from e
 
     def is_available(self) -> bool:
         """Check if the LLM endpoint is reachable."""
