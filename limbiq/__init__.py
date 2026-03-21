@@ -28,6 +28,13 @@ from limbiq.graph.pattern_completion import PatternCompletion
 from limbiq.graph.reasoning import GraphReasoner, ReasoningResult
 from limbiq.llm import LLMClient
 from limbiq.search import SearchClient, SearchResult
+from limbiq.onboarding import OnboardingManager, AgentProfile
+from limbiq.tools import (
+    ToolRegistry, BaseTool, ToolResult,
+    FileReaderTool, TerminalTool, CalculatorTool,
+    format_tool_results,
+)
+from limbiq.model_router import ModelRouter
 
 
 class Limbiq:
@@ -342,4 +349,17 @@ __all__ = [
     "BehavioralRule",
     "KnowledgeCluster",
     "RetrievalConfig",
+    # Onboarding
+    "OnboardingManager",
+    "AgentProfile",
+    # Tools
+    "ToolRegistry",
+    "BaseTool",
+    "ToolResult",
+    "FileReaderTool",
+    "TerminalTool",
+    "CalculatorTool",
+    "format_tool_results",
+    # Model routing
+    "ModelRouter",
 ]

@@ -254,8 +254,12 @@ class LimbiqCore:
         self.entity_extractor.extract_from_memory(message)
         self.entity_extractor.extract_from_memory(response)
 
-        # Store user message as short-term memory (if substantive)
-        if len(message.strip()) > 20:
+        # Only store raw user message as memory when NO signals fired and
+        # NO entities were extracted. When dopamine fires or the graph captures
+        # entities, the structured stores are authoritative. Raw "User said: ..."
+        # fragments alongside structured facts cause LLM confabulation.
+        has_signals = len(events) > 0
+        if len(message.strip()) > 20 and not has_signals:
             embedding = msg_embedding
             self.store.store(
                 content=f"User said: {message}",

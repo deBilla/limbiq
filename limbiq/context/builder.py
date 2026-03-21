@@ -12,6 +12,14 @@ from limbiq.types import Memory, BehavioralRule
 class ContextBuilder:
     def __init__(self, max_tokens: int = 1500):
         self.max_tokens = max_tokens
+        self.last_token_count: int = 0
+
+    # ── Token estimation ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Rough token estimate: ~0.75 words per token."""
+        return max(1, len(text.split()) * 4 // 3)
 
     def build(
         self,
@@ -25,34 +33,35 @@ class ContextBuilder:
         world_summary: str = None,
         search_results: list = None,
     ) -> str:
-        sections = []
+        # ── Build candidate sections ──────────────────────────────────────────
 
-        # Caution flag comes FIRST
+        # Mandatory: never skip these
+        mandatory_sections = []
+
         if caution_flag:
-            sections.append(
+            mandatory_sections.append(
                 f"[CAUTION: {caution_flag}]\n"
                 "Double-check your claims against the provided memory context. "
                 "If you're not sure about something, say so explicitly."
             )
 
-        # Graph answer — the most token-efficient knowledge representation
-        # e.g. "Upananda is your father and Prabhashi's father-in-law." = 15 tokens
         if graph_answer:
-            sections.append(f"[KNOWN FACT] {graph_answer}")
+            mandatory_sections.append(f"[KNOWN FACT] {graph_answer}")
 
-        # Compact world summary from graph — replaces raw memory dump
-        # e.g. "Your father is Upananda. Your wife is Prabhashi." = 20 tokens
         if world_summary:
-            sections.append(f"[ABOUT YOU] {world_summary}")
+            mandatory_sections.append(f"[ABOUT YOU] {world_summary}")
 
-        # Web search results — fresh knowledge from the internet
+        # Skippable sections (added in priority order until budget exhausted)
+        skippable_sections = []
+
+        # Web search results
         if search_results:
             from urllib.parse import urlparse
             items = []
             for sr in search_results[:3]:
                 domain = urlparse(sr.url).netloc if sr.url else sr.source
                 items.append(f'  - "{sr.title}" ({domain}): {sr.snippet}')
-            sections.append(
+            skippable_sections.append(
                 "[WEB SEARCH — recent information from the internet]\n"
                 + "\n".join(items)
             )
@@ -60,23 +69,22 @@ class ContextBuilder:
         # Behavioral rules (serotonin)
         if active_rules:
             rules_text = "; ".join(rule.rule_text for rule in active_rules)
-            sections.append(f"[STYLE] {rules_text}")
+            skippable_sections.append(f"[STYLE] {rules_text}")
 
-        # Priority memories that AREN'T already covered by the graph.
-        # When the graph has a world summary, most priority memories are
-        # redundant (they were the source of graph entities). Only include
-        # ones the graph doesn't know about.
+        # Priority memories not already covered by the graph
         if priority_memories:
             world_lower = (world_summary or "").lower()
             graph_lower = (graph_answer or "").lower()
             combined_lower = world_lower + " " + graph_lower
             ungraphed = [
                 m for m in priority_memories
-                if not self._is_covered_by_summary(m.content, combined_lower)
+                if not m.content.startswith("User said:")
+                and not m.content.startswith("User asked:")
+                and not self._is_covered_by_summary(m.content, combined_lower)
             ]
             if ungraphed:
                 facts = "\n".join(f"  - {m.content}" for m in ungraphed[:3])
-                sections.append(
+                skippable_sections.append(
                     f"[IMPORTANT -- known facts about this user]\n{facts}"
                 )
 
@@ -88,7 +96,7 @@ class ContextBuilder:
                 topics_seen.add(topic)
             cluster_facts = "\n".join(f"  - {m.content}" for m in cluster_memories)
             topic_label = ", ".join(topics_seen) if topics_seen else "this topic"
-            sections.append(
+            skippable_sections.append(
                 f"[DOMAIN KNOWLEDGE -- {topic_label}]\n{cluster_facts}"
             )
 
@@ -103,30 +111,54 @@ class ContextBuilder:
                 if m.id not in priority_ids
                 and m.id not in suppressed_ids
                 and m.id not in cluster_ids
+                and not m.content.startswith("User said:")
+                and not m.content.startswith("User asked:")
                 and not self._is_covered_by_summary(m.content, combined_lower)
             ]
 
-            # When graph provides context, cap relevant memories aggressively
             max_relevant = 2 if (world_summary or graph_answer) else 5
             if filtered:
                 items = "\n".join(
                     f"  - [{m.confidence:.0%} confidence] {m.content}"
                     for m in filtered[:max_relevant]
                 )
-                sections.append(
+                skippable_sections.append(
                     f"[Relevant memories from previous conversations]\n{items}"
                 )
 
-        if not sections:
+        # ── Apply token budget ────────────────────────────────────────────────
+        final_sections = self._build_with_budget(mandatory_sections, skippable_sections)
+
+        if not final_sections:
+            self.last_token_count = 0
             return ""
 
-        context = "\n\n".join(sections)
+        context = "\n\n".join(final_sections)
 
         return (
             "<memory_context>\n"
             f"{context}\n"
             "</memory_context>"
         )
+
+    def _build_with_budget(self, mandatory: list[str], skippable: list[str]) -> str:
+        """
+        Assemble sections within the token budget.
+        Mandatory sections are always included.
+        Skippable sections are added in order until the budget is exhausted.
+        """
+        used_tokens = sum(self._estimate_tokens(s) for s in mandatory)
+        result = list(mandatory)
+
+        for section in skippable:
+            cost = self._estimate_tokens(section)
+            if used_tokens + cost <= self.max_tokens:
+                result.append(section)
+                used_tokens += cost
+            # else: skip this section entirely
+
+        self.last_token_count = used_tokens
+        return result
 
     @staticmethod
     def _is_covered_by_summary(memory_content: str, world_summary_lower: str) -> bool:

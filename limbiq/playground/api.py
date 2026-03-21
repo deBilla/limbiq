@@ -2,8 +2,17 @@
 REST API endpoints for Limbiq Playground.
 
 All endpoints are prefixed with /api/v1/.
+
+Features implemented:
+  1. Onboarding + agent persona
+  3. Tool use (/file, /run, /calc)
+  4. Auto fact-check against graph
+  5. Proactive session greeting
+  6. Chain-of-thought injection
+  7. Multi-model orchestration
 """
 
+import re
 import time
 import logging
 from typing import Optional
@@ -32,7 +41,81 @@ def _entity_map(lq) -> dict:
     return {e.id: e.name for e in lq.get_entities()}
 
 
-# ─── Health ───────────────────────────────────────────────────
+# ── CoT detection helpers ─────────────────────────────────────────────────────
+
+_COT_RE = re.compile(
+    r"\b(why|how|explain|what if|compare|because|reason|cause|differ|"
+    r"analyse|analyze|understand|describe|illustrate|demonstrate|evaluate)\b",
+    re.IGNORECASE,
+)
+_MULTI_HOP_RE = re.compile(r"\b(and|also|then|first|second|third|finally|after)\b", re.IGNORECASE)
+
+
+def _needs_cot(query: str, signals: list = None) -> bool:
+    """Return True when chain-of-thought guidance would help."""
+    signals = signals or []
+    sig_types = {str(getattr(s, "signal_type", s)).lower() for s in signals}
+    if any("norepinephrine" in t for t in sig_types):
+        return True
+    if _COT_RE.search(query):
+        return True
+    if len(_MULTI_HOP_RE.findall(query)) >= 2:
+        return True
+    return False
+
+
+# ── Fact-check helpers ────────────────────────────────────────────────────────
+
+_CLAIM_RE = re.compile(
+    r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+is\s+(?:your\s+)?([a-zA-Z\s]+)",
+    re.MULTILINE,
+)
+
+
+def _extract_claims(text: str) -> list[tuple[str, str]]:
+    """Extract simple subject-predicate claims from LLM output."""
+    claims = []
+    for m in _CLAIM_RE.finditer(text):
+        subject = m.group(1).strip()
+        predicate = m.group(2).strip().rstrip(".,!?")
+        if 2 < len(subject) < 50 and 1 < len(predicate) < 60:
+            claims.append((subject, predicate))
+    return claims[:5]  # limit to 5 claims per response
+
+
+def _fact_check(lq, response_text: str) -> tuple[bool, list[str]]:
+    """
+    Check LLM claims against the knowledge graph.
+    Returns (fact_checked, list_of_corrections).
+    """
+    claims = _extract_claims(response_text)
+    if not claims:
+        return False, []
+
+    corrections = []
+    for subject, predicate in claims:
+        try:
+            query = f"Who is {subject}?"
+            result = lq.query_graph(query)
+            if result.get("answered") and result.get("confidence", 0) > 0.8:
+                graph_answer = result.get("answer", "")
+                # Simple heuristic: if the predicate words aren't in the graph answer,
+                # it might be contradicted.
+                pred_words = set(predicate.lower().split())
+                answer_words = set(graph_answer.lower().split())
+                overlap = pred_words & answer_words
+                # Only flag if there's near-zero overlap with something the graph knows
+                if graph_answer and len(overlap) == 0 and len(pred_words) > 1:
+                    corrections.append(
+                        f"Note: My records say {graph_answer}"
+                    )
+        except Exception:
+            pass  # graph check failed silently
+
+    return bool(corrections), corrections
+
+
+# ── Health ─────────────────────────────────────────────────────────────────────
 
 @router.get("/health")
 async def health(request: Request):
@@ -44,7 +127,80 @@ async def health(request: Request):
     }
 
 
-# ─── Process & Observe ────────────────────────────────────────
+# ── Onboarding ────────────────────────────────────────────────────────────────
+
+@router.get("/onboarding")
+async def get_onboarding(request: Request):
+    """Return current onboarding state and profile."""
+    mgr = getattr(request.app.state, "onboarding_manager", None)
+    if mgr is None:
+        return {"complete": True, "agent_name": "Limbiq", "user_name": ""}
+    profile = mgr.get_profile()
+    return {
+        "complete": profile.onboarding_complete,
+        "agent_name": profile.agent_name,
+        "user_name": profile.user_name,
+    }
+
+
+# ── Greeting ──────────────────────────────────────────────────────────────────
+
+@router.get("/greeting")
+async def get_greeting(request: Request):
+    """Generate a personalised session greeting."""
+    lq = _get_lq(request)
+    llm = getattr(request.app.state, "llm", None)
+    mgr = getattr(request.app.state, "onboarding_manager", None)
+    model_router = getattr(request.app.state, "model_router", None)
+
+    profile = mgr.get_profile() if mgr else None
+    agent_name = profile.agent_name if profile else "Limbiq"
+    user_name = profile.user_name if profile else ""
+
+    # Count known facts
+    try:
+        world = lq.get_world_summary()
+        facts_known = len([s for s in world.split(".") if s.strip()])
+    except Exception:
+        world = ""
+        facts_known = 0
+
+    # Build greeting
+    effective_llm = None
+    if model_router:
+        effective_llm = model_router.route("greeting", None, [])
+    elif llm:
+        effective_llm = llm
+
+    if effective_llm and world:
+        try:
+            prompt_msgs = [
+                {"role": "system", "content":
+                    f"You are {agent_name}, a helpful assistant. "
+                    "Generate a short, warm, 1-sentence greeting for the user, "
+                    "referencing one interesting thing you remember about them. "
+                    "Be natural and brief. Do NOT use markdown."},
+                {"role": "user", "content": f"Known facts: {world[:300]}"},
+            ]
+            greeting = effective_llm.chat(prompt_msgs)
+        except Exception:
+            greeting = _template_greeting(agent_name, user_name, world)
+    else:
+        greeting = _template_greeting(agent_name, user_name, world)
+
+    return {"greeting": greeting, "facts_known": facts_known}
+
+
+def _template_greeting(agent_name: str, user_name: str, world: str) -> str:
+    name_part = f"Hi {user_name}!" if user_name else "Hi!"
+    agent_part = f"I'm {agent_name}."
+    if world:
+        first_fact = world.split(".")[0].strip()
+        return f"{name_part} {agent_part} I remember that {first_fact.lower()}."
+    return f"{name_part} {agent_part} How can I help you today?"
+
+
+# ── Process & Observe ──────────────────────────────────────────────────────────
 
 @router.post("/process", response_model=ProcessResponse)
 async def process_message(body: QueryRequest, request: Request):
@@ -103,21 +259,28 @@ async def observe_exchange(body: ObserveRequest, request: Request):
         }
 
 
-# ─── Chat (full loop: process → answer → observe) ────────────
+# ── Chat (full loop: process → answer → observe) ──────────────────────────────
 
 @router.post("/chat")
 async def chat(body: QueryRequest, request: Request):
     """
     Full conversation loop — process + LLM generate + search + observe.
 
-    If an LLM is connected, it generates a real response using limbiq's
-    memory context. When the LLM indicates uncertainty (or user uses /search),
-    triggers web search, re-prompts with results, and stores findings.
+    Includes:
+      - Onboarding flow (first 2 messages)
+      - Tool use (/file, /run, /calc)
+      - Fact-checking against graph
+      - Chain-of-thought injection
+      - Multi-model routing
     """
     lq = _get_lq(request)
-    llm = getattr(request.app.state, "llm", None)
+    llm_base = getattr(request.app.state, "llm", None)
     search_client = getattr(request.app.state, "search_client", None)
-    logger.info(f"Chat: llm={'yes' if llm else 'no'}, search={'yes' if search_client else 'no'}")
+    model_router = getattr(request.app.state, "model_router", None)
+    onboarding_mgr = getattr(request.app.state, "onboarding_manager", None)
+    tool_registry = getattr(request.app.state, "tool_registry", None)
+
+    logger.info(f"Chat: llm={'yes' if llm_base else 'no'}, search={'yes' if search_client else 'no'}")
     tracer = get_tracer()
     met = get_metrics()
 
@@ -126,15 +289,92 @@ async def chat(body: QueryRequest, request: Request):
         request.app.state.chat_history = []
     history = request.app.state.chat_history
 
-    # Check for /search command prefix
-    user_message = body.message
-    force_search = user_message.startswith("/search ")
-    if force_search:
-        user_message = user_message[8:].strip()
+    # ── Onboarding flow ───────────────────────────────────────────────────────
+    if onboarding_mgr and not onboarding_mgr.is_complete():
+        step = getattr(request.app.state, "onboarding_step", 0)
+        user_message = body.message.strip()
 
+        if step == 0:
+            # First message: ask for user name
+            request.app.state.onboarding_step = 1
+            return {
+                "message": user_message,
+                "response": "Hi! I'm Limbiq. Before we start, what's your name?",
+                "llm_used": False, "search_used": False, "search_results_count": 0,
+                "graph_answered": False, "graph_answer": "", "graph_confidence": 0,
+                "reason_answer": "", "reason_confidence": 0,
+                "context": "", "memories_retrieved": 0, "signals_fired": [],
+                "stored": False, "duration_ms": 0,
+                "tools_used": [], "fact_checked": False, "corrections": [],
+                "cot_used": False, "model_used": "none",
+            }
+
+        if step == 1:
+            # Store user name, ask for agent name
+            # Guard: if empty or looks like a system message, re-ask
+            if not user_message or user_message.startswith("__") or len(user_message) < 2:
+                return {
+                    "message": user_message,
+                    "response": "What's your name? Just type it and I'll remember it.",
+                    "llm_used": False, "search_used": False, "search_results_count": 0,
+                    "graph_answered": False, "graph_answer": "", "graph_confidence": 0,
+                    "reason_answer": "", "reason_confidence": 0,
+                    "context": "", "memories_retrieved": 0, "signals_fired": [],
+                    "stored": False, "duration_ms": 0,
+                    "tools_used": [], "fact_checked": False, "corrections": [],
+                    "cot_used": False, "model_used": "none",
+                }
+            onboarding_mgr.set_user_name(user_message)
+            request.app.state.onboarding_step = 2
+            return {
+                "message": user_message,
+                "response": f"Nice to meet you, {user_message}! What would you like to call me?",
+                "llm_used": False, "search_used": False, "search_results_count": 0,
+                "graph_answered": False, "graph_answer": "", "graph_confidence": 0,
+                "reason_answer": "", "reason_confidence": 0,
+                "context": "", "memories_retrieved": 0, "signals_fired": [],
+                "stored": False, "duration_ms": 0,
+                "tools_used": [], "fact_checked": False, "corrections": [],
+                "cot_used": False, "model_used": "none",
+            }
+
+        if step == 2:
+            # Store agent name, complete onboarding
+            onboarding_mgr.set_agent_name(user_message)
+            onboarding_mgr.complete()
+            request.app.state.onboarding_step = 3
+            profile = onboarding_mgr.get_profile()
+            return {
+                "message": user_message,
+                "response": (
+                    f"Perfect! I'm {profile.agent_name} and I'll remember that name. "
+                    f"Now, {profile.user_name}, what's on your mind?"
+                ),
+                "llm_used": False, "search_used": False, "search_results_count": 0,
+                "graph_answered": False, "graph_answer": "", "graph_confidence": 0,
+                "reason_answer": "", "reason_confidence": 0,
+                "context": "", "memories_retrieved": 0, "signals_fired": [],
+                "stored": False, "duration_ms": 0,
+                "tools_used": [], "fact_checked": False, "corrections": [],
+                "cot_used": False, "model_used": "none",
+            }
+
+    # ── Normal chat flow ──────────────────────────────────────────────────────
     with tracer.start_as_current_span("api.chat") as span:
-        span.set_attribute("message", user_message)
-        span.set_attribute("llm_connected", llm is not None)
+        # Check for tool command
+        user_message = body.message
+        force_search = user_message.startswith("/search ")
+        if force_search:
+            user_message = user_message[8:].strip()
+
+        # Detect tool request before anything else
+        tool_request = None
+        tools_used = []
+        if tool_registry:
+            tool_request = tool_registry.detect_tool_request(user_message)
+
+        span.set_attribute("message", user_message[:200])
+        span.set_attribute("llm_connected", llm_base is not None)
         span.set_attribute("search_connected", search_client is not None)
         t0 = time.time()
 
@@ -159,29 +399,76 @@ async def chat(body: QueryRequest, request: Request):
         except Exception:
             pass
 
-        # Step 3: Generate response (first pass)
-        llm_used = False
+        # ── Select model ──────────────────────────────────────────────────────
+        signal_events_raw = []  # populated after observe below
+        if model_router:
+            llm = model_router.route(user_message, process_result, [])
+            model_used = model_router.get_model_name(user_message, process_result, [])
+        elif llm_base:
+            llm = llm_base
+            model_used = getattr(llm_base, "model", "default")
+        else:
+            llm = None
+            model_used = "none"
+
+        # ── Build system prompt ───────────────────────────────────────────────
         search_connected = search_client is not None
+
+        # Agent persona
+        persona_parts = []
+        if onboarding_mgr:
+            profile = onboarding_mgr.get_profile()
+            if profile.agent_name:
+                persona_parts.append(f"Your name is {profile.agent_name}.")
+            if profile.user_name:
+                persona_parts.append(f"You were named by {profile.user_name}.")
+        persona_str = " ".join(persona_parts)
+
         system_parts = [
-            "You are a helpful, honest assistant. You have a memory system that "
-            "stores facts from previous conversations. Those facts are provided "
-            "below inside <memory_context> tags.\n\n"
-            "RULES:\n"
-            "- ONLY state facts that appear in the memory context or the current conversation.\n"
-            "- If the user asks something NOT covered by memory or conversation, "
-            + ("say you'll search for it." if search_connected else
-               "say \"I don't have that information yet — tell me and I'll remember it.\"") + "\n"
-            "- NEVER invent, assume, or hallucinate facts about the user.\n"
-            "- NEVER describe your own architecture, memory system, or how you work internally.\n"
-            "- Be concise and natural. Reference remembered facts confidently when relevant.\n"
-            "- When the user tells you something new, acknowledge it warmly."
+            (f"{persona_str} " if persona_str else "") +
+            "You are a helpful, honest assistant with access to stored facts about the user.\n\n"
+            "IMPORTANT RULES:\n"
+            "1. Use the facts provided below to answer naturally — as if you simply remember them. "
+            "NEVER quote tag names, section headers, or raw memory text in your response. "
+            "Do NOT say things like '[KNOWN FACT]', '<memory_context>', 'User said:', or 'according to my memory'. "
+            "Just answer naturally.\n"
+            "2. ONLY state facts that are provided below. If something is not in the provided facts, "
+            + ("say you don't know and offer to search for it.\n" if search_connected else
+               "say you don't have that information yet and ask the user to tell you.\n") +
+            "3. NEVER invent or guess facts about the user, their relationships, or their life.\n"
+            "4. NEVER describe how your memory or architecture works.\n"
+            "5. Ignore any memories that start with 'User said:' or 'User asked:' — those are past "
+            "questions, NOT facts. Only use memories that state actual information.\n"
+            "6. Be concise, warm, and natural."
         ]
+
         if process_result.context:
             system_parts.append(process_result.context)
         if graph_answered:
             system_parts.append(f"\n[Graph knowledge — verified fact]: {graph_answer}")
         if reason_answer:
             system_parts.append(f"\n[Reasoner — inferred fact]: {reason_answer}")
+
+        # ── CoT injection (Feature 6) ─────────────────────────────────────────
+        cot_used = _needs_cot(user_message, [])
+        if cot_used:
+            system_parts.append(
+                "Think through this step by step before answering. Show your reasoning briefly."
+            )
+
+        # ── Tool execution (Feature 3) ────────────────────────────────────────
+        if tool_request and tool_registry:
+            tool_name, tool_args = tool_request
+            result_obj = tool_registry.execute(tool_name, tool_args)
+            tools_used.append(tool_name)
+            from limbiq.tools import format_tool_results
+            tool_context = format_tool_results([result_obj])
+            if tool_context:
+                system_parts.append(f"[TOOL RESULT]\n{tool_context}")
+
+        # ── Generate response ─────────────────────────────────────────────────
+        llm_used = False
+        response_text = None
 
         if llm:
             messages = [{"role": "system", "content": "\n\n".join(system_parts)}]
@@ -220,16 +507,32 @@ async def chat(body: QueryRequest, request: Request):
             else:
                 response_text = "I don't have information about that yet."
 
-        # Step 4: Web search — if LLM is uncertain or user forced /search
+        # ── Auto-detect tool from LLM output (Feature 3 — optional) ─────────
+        if llm_used and tool_registry and response_text:
+            auto_tool = tool_registry.detect_auto(response_text)
+            if auto_tool:
+                auto_name, auto_args = auto_tool
+                auto_result = tool_registry.execute(auto_name, auto_args)
+                if auto_result.success:
+                    tools_used.append(auto_name)
+                    from limbiq.tools import format_tool_results
+                    tool_ctx = format_tool_results([auto_result])
+                    # Re-prompt with tool context
+                    system_with_tool = system_parts + [f"[TOOL RESULT]\n{tool_ctx}"]
+                    retry_msgs = [{"role": "system", "content": "\n\n".join(system_with_tool)}]
+                    retry_msgs.extend(history[-12:])
+                    retry_msgs.append({"role": "user", "content": user_message})
+                    try:
+                        response_text = llm.chat(retry_msgs)
+                    except Exception:
+                        pass  # keep original response
+
+        # ── Web search ────────────────────────────────────────────────────────
         search_used = False
         search_results = []
         if search_client:
             from limbiq.search import detect_uncertainty
 
-            # Search triggers when:
-            # 1. User forced with /search prefix
-            # 2. LLM response shows uncertainty
-            # 3. No LLM connected AND no graph/reasoner answer (nothing useful to say)
             no_answer = not graph_answered and not reason_answer
             needs_search = force_search or (
                 detect_uncertainty(response_text)
@@ -237,7 +540,7 @@ async def chat(body: QueryRequest, request: Request):
                 not llm_used and no_answer
             )
 
-            logger.info(f"Search check: needs_search={needs_search}, uncertainty={detect_uncertainty(response_text)}, force={force_search}, response_preview={response_text[:150]!r}")
+            logger.info(f"Search check: needs_search={needs_search}, uncertainty={detect_uncertainty(response_text)}, force={force_search}")
 
             if needs_search:
                 logger.info(f"Searching for: {user_message}")
@@ -267,18 +570,28 @@ async def chat(body: QueryRequest, request: Request):
                     response_text = llm.chat(messages_retry)
                 except Exception as e:
                     logger.warning(f"LLM re-prompt with search failed: {e}")
-                    # Keep original response
 
-        # Step 5: Update conversation history
+        # ── Fact-check (Feature 4) ────────────────────────────────────────────
+        fact_checked = False
+        corrections = []
+        if response_text:
+            try:
+                fact_checked, corrections = _fact_check(lq, response_text)
+                if corrections:
+                    response_text = response_text + "\n\n" + " ".join(corrections)
+            except Exception as e:
+                logger.warning(f"Fact-check failed: {e}")
+
+        # ── Update conversation history ────────────────────────────────────────
         history.append({"role": "user", "content": user_message})
         history.append({"role": "assistant", "content": response_text})
         if len(history) > 40:
             request.app.state.chat_history = history[-24:]
 
-        # Step 6: Observe — signals fire, entities extracted, memory stored
+        # ── Observe — signals fire, entities extracted, memory stored ─────────
         events = lq.observe(user_message, response_text)
 
-        # Also observe search results as facts — persists for future queries
+        # Also observe search results as facts
         if search_used:
             for sr in search_results[:3]:
                 fact = f"{sr.title}: {sr.snippet}"
@@ -320,10 +633,15 @@ async def chat(body: QueryRequest, request: Request):
             "signals_fired": signal_events,
             "stored": True,
             "duration_ms": duration_ms,
+            "tools_used": tools_used,
+            "fact_checked": fact_checked,
+            "corrections": corrections,
+            "cot_used": cot_used,
+            "model_used": model_used,
         }
 
 
-# ─── Graph Queries ────────────────────────────────────────────
+# ── Graph Queries ──────────────────────────────────────────────────────────────
 
 @router.post("/graph/query", response_model=GraphQueryResponse)
 async def query_graph(body: QueryRequest, request: Request):
@@ -390,7 +708,7 @@ async def reason(body: QueryRequest, request: Request):
             )
 
 
-# ─── Graph Exploration ────────────────────────────────────────
+# ── Graph Exploration ──────────────────────────────────────────────────────────
 
 @router.get("/graph/entities")
 async def get_entities(request: Request):
@@ -399,7 +717,6 @@ async def get_entities(request: Request):
     entities = lq.get_entities()
     rels = lq.get_relations(include_inferred=True)
 
-    # Count relations per entity
     rel_counts = {}
     for r in rels:
         rel_counts[r.subject_id] = rel_counts.get(r.subject_id, 0) + 1
@@ -468,7 +785,6 @@ async def get_graph_network(request: Request):
             "inferred": r.is_inferred,
         }
         for r in rels
-        # Only include links where both ends exist
         if r.subject_id in emap and r.object_id in emap
     ]
 
@@ -491,7 +807,6 @@ async def describe_entity(name: str, request: Request):
     emap = _entity_map(lq)
     rels = lq.get_relations(include_inferred=True)
 
-    # Find entity
     entity = None
     for e in lq.get_entities():
         if e.name.lower() == name.lower():
@@ -501,7 +816,6 @@ async def describe_entity(name: str, request: Request):
     if not entity:
         raise HTTPException(status_code=404, detail=f"Entity '{name}' not found")
 
-    # Get relations involving this entity
     outgoing = []
     incoming = []
     for r in rels:
@@ -536,7 +850,7 @@ async def describe_entity(name: str, request: Request):
     }
 
 
-# ─── Stats & Profile ─────────────────────────────────────────
+# ── Stats & Profile ────────────────────────────────────────────────────────────
 
 @router.get("/stats", response_model=StatsResponse)
 async def get_stats(request: Request):
@@ -563,13 +877,11 @@ async def get_profile(request: Request):
     rels = lq.get_relations(include_inferred=True)
     emap = _entity_map(lq)
 
-    # World summary
     try:
         world = lq.get_world_summary()
     except Exception:
         world = ""
 
-    # Priority facts
     try:
         priority = lq.get_priority_memories()
         priority_facts = [m.content for m in priority[:20]] if priority else []
@@ -585,7 +897,7 @@ async def get_profile(request: Request):
     }
 
 
-# ─── Operations ───────────────────────────────────────────────
+# ── Operations ─────────────────────────────────────────────────────────────────
 
 @router.post("/propagate")
 async def run_propagate(request: Request):
@@ -642,7 +954,7 @@ async def train_reasoner(body: TrainRequest, request: Request):
             return TrainResponse(status=f"error: {e}")
 
 
-# ─── Telemetry ────────────────────────────────────────────────
+# ── Telemetry ──────────────────────────────────────────────────────────────────
 
 @router.get("/telemetry/traces")
 async def get_traces(limit: int = Query(50)):

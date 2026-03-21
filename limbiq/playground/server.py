@@ -25,6 +25,7 @@ def create_app(
     embedding_model: str = "all-MiniLM-L6-v2",
     llm_client=None,
     search_client=None,
+    model_router=None,
 ) -> FastAPI:
     """Create and configure the FastAPI application."""
 
@@ -32,17 +33,34 @@ def create_app(
     async def lifespan(app: FastAPI):
         """Startup/shutdown lifecycle."""
         from limbiq import Limbiq
+        from limbiq.onboarding import OnboardingManager
+        from limbiq.tools import ToolRegistry
 
         logger.info(f"Initializing Limbiq (store={store_path}, user={user_id})")
-        app.state.lq = Limbiq(
+        lq = Limbiq(
             store_path=store_path,
             user_id=user_id,
             embedding_model=embedding_model,
             llm_fn=llm_client,
         )
+        app.state.lq = lq
         app.state.llm = llm_client
         app.state.search_client = search_client
         app.state.start_time = time.time()
+        app.state.model_router = model_router
+        app.state.onboarding_step = 0
+
+        # Onboarding manager — uses MemoryStore's thread-safe db
+        try:
+            app.state.onboarding_manager = OnboardingManager(lq._core.store)
+            logger.info("OnboardingManager initialized")
+        except Exception as e:
+            logger.warning(f"OnboardingManager init failed: {e}")
+            app.state.onboarding_manager = None
+
+        # Tool registry
+        app.state.tool_registry = ToolRegistry()
+        logger.info("ToolRegistry initialized")
 
         # Auto-instrument FastAPI with OpenTelemetry
         try:
@@ -442,11 +460,32 @@ function ChatView() {
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [agentName, setAgentName] = useState('Limbiq');
   const bottomRef = useRef(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  // On mount: fetch onboarding state
+  useEffect(() => {
+    api.get('/onboarding').then(ob => {
+      if (ob.agent_name) setAgentName(ob.agent_name);
+      if (ob.complete) {
+        // Onboarding done — show personalised greeting
+        api.get('/greeting').then(gr => {
+          if (gr.greeting) {
+            setMessages([{ role: 'assistant', content: gr.greeting, meta: {} }]);
+          }
+        }).catch(() => {});
+      } else {
+        // Onboarding not started yet — kick it off with a blank trigger
+        api.post('/chat', { message: '' }).then(res => {
+          setMessages([{ role: 'assistant', content: res.response, meta: {} }]);
+        }).catch(() => {});
+      }
+    }).catch(() => {});
+  }, []);
 
   const send = async () => {
     if (!input.trim() || loading) return;
@@ -457,6 +496,10 @@ function ChatView() {
 
     try {
       const res = await api.post('/chat', { message: userMsg });
+      // Refresh agent name in case onboarding just completed
+      if (res.model_used !== undefined) {
+        api.get('/onboarding').then(ob => { if (ob.agent_name) setAgentName(ob.agent_name); }).catch(() => {});
+      }
       setMessages(prev => [...prev, {
         role: 'assistant',
         content: res.response,
@@ -472,6 +515,11 @@ function ChatView() {
           signals_fired: res.signals_fired || [],
           duration_ms: res.duration_ms,
           context: res.context,
+          tools_used: res.tools_used || [],
+          fact_checked: res.fact_checked,
+          corrections: res.corrections || [],
+          cot_used: res.cot_used,
+          model_used: res.model_used,
         },
       }]);
     } catch (e) {
@@ -486,10 +534,11 @@ function ChatView() {
         {messages.length === 0 && (
           <div style={{ textAlign: 'center', marginTop: 80, color: 'var(--text-dim)' }}>
             <div style={{ fontSize: 32, marginBottom: 8 }}>&#129504;</div>
-            <div style={{ fontSize: 16, fontWeight: 500 }}>Limbiq Chat</div>
+            <div style={{ fontSize: 16, fontWeight: 500 }}>{agentName}</div>
             <div style={{ fontSize: 13, marginTop: 4 }}>Tell me things. Ask me questions. I learn as we talk.</div>
             <div style={{ fontSize: 12, marginTop: 16, color: 'var(--text-dim)' }}>
-              Try: "My name is Dimuthu" then "My wife is Prabhashi" then "What is my wife's name?"
+              Try: "My name is Dimuthu" then "My wife is Prabhashi" then "What is my wife's name?"<br/>
+              Tools: /file /path/to/file · /run ls · /calc 2**10
             </div>
           </div>
         )}
@@ -505,6 +554,9 @@ function ChatView() {
             )}
             {m.role === 'assistant' && (
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 4 }}>
+                <div style={{ fontSize: 11, color: 'var(--text-dim)', paddingLeft: 4, marginBottom: 2 }}>
+                  {agentName}
+                </div>
                 <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', padding: '10px 14px',
                               borderRadius: '16px 16px 16px 4px', maxWidth: '80%', fontSize: 14 }}>
                   {m.content}
@@ -512,6 +564,9 @@ function ChatView() {
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', fontSize: 11, color: 'var(--text-dim)', paddingLeft: 4 }}>
                   {m.meta?.llm_used && (
                     <span style={{ color: 'var(--cyan)' }}>LLM</span>
+                  )}
+                  {m.meta?.model_used && m.meta.model_used !== 'none' && (
+                    <span style={{ color: 'var(--cyan)', opacity: 0.8 }}>({m.meta.model_used})</span>
                   )}
                   {m.meta?.search_used && (
                     <span style={{ color: 'var(--orange)' }}>
@@ -527,6 +582,17 @@ function ChatView() {
                     <span style={{ color: 'var(--purple)' }}>
                       reasoner ({(m.meta.reason_confidence * 100).toFixed(0)}%)
                     </span>
+                  )}
+                  {m.meta?.tools_used?.length > 0 && (
+                    <span style={{ color: 'var(--orange)' }}>
+                      tools: {m.meta.tools_used.join(', ')}
+                    </span>
+                  )}
+                  {m.meta?.cot_used && (
+                    <span style={{ color: 'var(--yellow)' }}>CoT</span>
+                  )}
+                  {m.meta?.fact_checked && (
+                    <span style={{ color: 'var(--green)' }}>fact-checked</span>
                   )}
                   {m.meta?.memories_retrieved > 0 && (
                     <span>{m.meta.memories_retrieved} memories</span>
@@ -560,7 +626,7 @@ function ChatView() {
           <div style={{ display: 'flex', alignItems: 'flex-start' }}>
             <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', padding: '10px 14px',
                           borderRadius: '16px 16px 16px 4px', fontSize: 14, color: 'var(--text-dim)' }}>
-              Thinking...
+              {agentName} is thinking...
             </div>
           </div>
         )}
@@ -568,7 +634,7 @@ function ChatView() {
       </div>
       <div style={{ borderTop: '1px solid var(--border)', padding: '12px 0 0 0', display: 'flex', gap: 8 }}>
         <input value={input} onChange={e => setInput(e.target.value)}
-               placeholder="Tell me something or ask a question..."
+               placeholder="Tell me something or ask a question... (/file /run /calc)"
                onKeyDown={e => e.key === 'Enter' && send()}
                style={{ flex: 1 }} />
         <button className="primary" onClick={send} disabled={loading}>
