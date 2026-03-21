@@ -60,6 +60,22 @@ UNCERTAINTY_PHRASES = [
     "i don't have current",
     "i cannot access the internet",
     "i can't access the internet",
+    "i'll search for",
+    "i'll search",
+    "i don't have that information",
+    "tell me and i'll remember",
+    "i don't have information about",
+    "i don't recall",
+    "i have no memory of",
+    "not in my memory",
+    "i haven't been told",
+    "no information about that",
+    "i don't have enough information",
+    "let me search",
+    "i'll look that up",
+    "i don't have personal experiences",
+    "i can try to find",
+    "i'll try to find",
     "i can't browse",
     "i cannot browse",
 ]
@@ -258,7 +274,10 @@ class SearchClient:
 
     def _get_json(self, url: str, headers: dict = None) -> dict:
         """GET request, return parsed JSON."""
-        hdrs = {"Accept": "application/json"}
+        hdrs = {
+            "Accept": "application/json",
+            "User-Agent": "limbiq/0.4.0",
+        }
         if headers:
             hdrs.update(headers)
         req = Request(url, headers=hdrs)

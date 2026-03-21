@@ -13,3 +13,4 @@ data/
 neuro_data/
 vectors/
 *.npy
+searxng/

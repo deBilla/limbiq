@@ -78,6 +78,11 @@ python -m limbiq.playground
 # With Ollama
 python -m limbiq.playground --llm-url http://localhost:11434/v1 --llm-model llama3.1
 
+# With Ollama + web search (SearXNG)
+python -m limbiq.playground \
+  --llm-url http://localhost:11434/v1 --llm-model llama3.1 \
+  --search-url http://localhost:8888
+
 # With OpenAI
 python -m limbiq.playground --llm-url https://api.openai.com/v1 --llm-model gpt-4o --llm-api-key sk-...
 
@@ -87,12 +92,41 @@ python -m limbiq.playground --llm-url http://localhost:8000/v1 --llm-model my-mo
 
 The playground includes:
 - **Chat** — talk to limbiq and watch it learn in real time (uses LLM if connected)
+- **Web Search** — auto-searches when the LLM doesn't know something, or use `/search` prefix
 - **Knowledge Graph** — interactive D3 visualization of entities and relations
 - **Entity Explorer** — browse entities and their relationships
 - **Query Builder** — test graph queries, memory retrieval, and the reasoner side by side
 - **Traces** — OpenTelemetry trace viewer for debugging
 
 Open `http://localhost:8765` after starting.
+
+### Web Search
+
+When connected, limbiq auto-detects LLM uncertainty and searches the web. Results are injected as context, the LLM re-answers, and findings are stored as memories for future queries.
+
+```bash
+# Self-hosted with SearXNG (free, recommended)
+docker run -d -p 8888:8080 searxng/searxng
+python -m limbiq.playground --search-url http://localhost:8888 ...
+
+# Brave Search (free tier: 2000 queries/month)
+python -m limbiq.playground --search-url https://api.search.brave.com --search-provider brave --search-api-key BSA-...
+
+# Tavily (free tier: 1000 queries/month)
+python -m limbiq.playground --search-url https://api.tavily.com --search-provider tavily --search-api-key tvly-...
+```
+
+Use `/search` prefix in chat to force a search: `/search latest SpaceX launch`
+
+Programmatic usage:
+```python
+from limbiq import SearchClient
+
+search = SearchClient(base_url="http://localhost:8888", provider="searxng")
+results = search("latest news on AI")
+for r in results:
+    print(f"{r.title}: {r.snippet}")
+```
 
 ## The Five Signals
 

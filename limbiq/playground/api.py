@@ -117,6 +117,7 @@ async def chat(body: QueryRequest, request: Request):
     lq = _get_lq(request)
     llm = getattr(request.app.state, "llm", None)
     search_client = getattr(request.app.state, "search_client", None)
+    logger.info(f"Chat: llm={'yes' if llm else 'no'}, search={'yes' if search_client else 'no'}")
     tracer = get_tracer()
     met = get_metrics()
 
@@ -160,13 +161,27 @@ async def chat(body: QueryRequest, request: Request):
 
         # Step 3: Generate response (first pass)
         llm_used = False
-        system_parts = ["You are a helpful assistant with a persistent memory."]
+        search_connected = search_client is not None
+        system_parts = [
+            "You are a helpful, honest assistant. You have a memory system that "
+            "stores facts from previous conversations. Those facts are provided "
+            "below inside <memory_context> tags.\n\n"
+            "RULES:\n"
+            "- ONLY state facts that appear in the memory context or the current conversation.\n"
+            "- If the user asks something NOT covered by memory or conversation, "
+            + ("say you'll search for it." if search_connected else
+               "say \"I don't have that information yet — tell me and I'll remember it.\"") + "\n"
+            "- NEVER invent, assume, or hallucinate facts about the user.\n"
+            "- NEVER describe your own architecture, memory system, or how you work internally.\n"
+            "- Be concise and natural. Reference remembered facts confidently when relevant.\n"
+            "- When the user tells you something new, acknowledge it warmly."
+        ]
         if process_result.context:
             system_parts.append(process_result.context)
         if graph_answered:
-            system_parts.append(f"\n[Graph knowledge]: {graph_answer}")
+            system_parts.append(f"\n[Graph knowledge — verified fact]: {graph_answer}")
         if reason_answer:
-            system_parts.append(f"\n[Reasoner]: {reason_answer}")
+            system_parts.append(f"\n[Reasoner — inferred fact]: {reason_answer}")
 
         if llm:
             messages = [{"role": "system", "content": "\n\n".join(system_parts)}]
@@ -211,16 +226,27 @@ async def chat(body: QueryRequest, request: Request):
         if search_client:
             from limbiq.search import detect_uncertainty
 
+            # Search triggers when:
+            # 1. User forced with /search prefix
+            # 2. LLM response shows uncertainty
+            # 3. No LLM connected AND no graph/reasoner answer (nothing useful to say)
+            no_answer = not graph_answered and not reason_answer
             needs_search = force_search or (
-                llm_used and detect_uncertainty(response_text)
+                detect_uncertainty(response_text)
+            ) or (
+                not llm_used and no_answer
             )
 
+            logger.info(f"Search check: needs_search={needs_search}, uncertainty={detect_uncertainty(response_text)}, force={force_search}, response_preview={response_text[:150]!r}")
+
             if needs_search:
+                logger.info(f"Searching for: {user_message}")
                 try:
                     search_results = search_client(user_message)
                     search_used = bool(search_results)
+                    logger.info(f"Search returned {len(search_results)} results")
                 except Exception as e:
-                    logger.warning(f"Web search failed: {e}")
+                    logger.error(f"Web search failed: {e}", exc_info=True)
 
             # Re-prompt LLM with search results
             if search_used and llm:
