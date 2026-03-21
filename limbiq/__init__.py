@@ -22,6 +22,12 @@ from limbiq.types import (
     KnowledgeCluster,
     RetrievalConfig,
 )
+from limbiq.graph.propagation import ActiveGraphPropagation, PropagationResult
+from limbiq.graph.gnn import GNNPropagation
+from limbiq.graph.pattern_completion import PatternCompletion
+from limbiq.graph.reasoning import GraphReasoner, ReasoningResult
+from limbiq.llm import LLMClient
+from limbiq.search import SearchClient, SearchResult
 
 
 class Limbiq:
@@ -109,6 +115,168 @@ class Limbiq:
         """Return all memories in a cluster."""
         return self._core.cluster_store.get_cluster_memories(cluster_id)
 
+    # -- Active Graph Propagation --
+
+    def propagate(self) -> "PropagationResult":
+        """
+        Run a full active graph propagation cycle.
+
+        This is the Phase 1 implementation of the active knowledge graph:
+        1. Suppress noise memories
+        2. Deflate inflated priorities
+        3. Merge duplicate memories
+        4. Repair knowledge graph (extract entities from existing memories)
+        5. Run graph inference
+        6. Compute node activations
+
+        Returns PropagationResult with statistics.
+        """
+        prop = ActiveGraphPropagation(
+            store=self._core.store,
+            graph=self._core.graph,
+            embedding_engine=self._core.embeddings,
+            user_name=self._core.user_id,
+        )
+        return prop.propagate()
+
+    def propagate_gnn(self, model_dir: str = "data/gnn",
+                      train_first: bool = False, epochs: int = 200) -> dict:
+        """
+        Run Phase 2 GNN-based propagation.
+
+        If train_first=True, trains the GNN on Phase 1 labels before propagating.
+        Falls back to Phase 1 if no trained model is found.
+        """
+        gnn = GNNPropagation(
+            store=self._core.store,
+            graph=self._core.graph,
+            embedding_engine=self._core.embeddings,
+            user_name=self._core.user_id,
+            model_dir=model_dir,
+        )
+        if train_first:
+            gnn.train_and_save(epochs=epochs)
+        return gnn.propagate()
+
+    def compute_activations_gnn(self, query: str = None,
+                                model_dir: str = "data/gnn") -> list:
+        """Compute GNN-based activations, optionally biased by a query."""
+        gnn = GNNPropagation(
+            store=self._core.store,
+            graph=self._core.graph,
+            embedding_engine=self._core.embeddings,
+            user_name=self._core.user_id,
+            model_dir=model_dir,
+        )
+        query_embedding = None
+        if query:
+            query_embedding = self._core.embeddings.embed(query)
+        return gnn.compute_activations(query_embedding)
+
+    def enable_activation_retrieval(self, gnn_model_dir: str = "data/gnn") -> bool:
+        """
+        Enable Phase 4 activation-weighted retrieval.
+        Requires a trained GNN model from Phase 2.
+        Returns True if successfully enabled.
+        """
+        return self._core.enable_activation_retrieval(gnn_model_dir)
+
+    def generate_graph_training_data(self, output_path: str = "data/training/graph_training.jsonl") -> int:
+        """
+        Generate LoRA training data from the knowledge graph.
+        Returns the number of training pairs generated.
+        """
+        from limbiq.retrieval.activation_retrieval import GraphTrainingDataGenerator
+        gen = GraphTrainingDataGenerator(
+            graph=self._core.graph,
+            inference_engine=self._core.inference_engine,
+            store_db=self._core.store.db,
+            user_name=self._core.user_id,
+        )
+        return gen.export_jsonl(output_path)
+
+    def run_pattern_completion(self, model_dir: str = "data/pattern",
+                               train_transe: bool = True, epochs: int = 500) -> dict:
+        """
+        Run Phase 3 pattern completion: entity resolution, relation mining,
+        TransE training, and learned inference.
+        """
+        pc = PatternCompletion(
+            store=self._core.store,
+            graph=self._core.graph,
+            embedding_engine=self._core.embeddings,
+            user_name=self._core.user_id,
+            model_dir=model_dir,
+        )
+        return pc.run(train_transe_model=train_transe, epochs=epochs)
+
+    def compute_activations(self, query: str = None) -> list:
+        """
+        Compute activation states for all memory nodes.
+        Optionally bias activations toward a query.
+        Returns list of ActivationState objects sorted by activation.
+        """
+        prop = ActiveGraphPropagation(
+            store=self._core.store,
+            graph=self._core.graph,
+            embedding_engine=self._core.embeddings,
+            user_name=self._core.user_id,
+        )
+        query_embedding = None
+        if query:
+            query_embedding = self._core.embeddings.embed(query)
+        return prop.compute_activations(query_embedding)
+
+    # -- Graph Reasoning (Phase 5) --
+
+    def train_reasoner(self, model_dir: str = "data/reasoner",
+                       epochs: int = 100) -> dict:
+        """
+        Train the micro-transformer graph reasoner.
+        Generates synthetic QA data from the knowledge graph and trains.
+        """
+        user_name = getattr(self._core, '_graph_user_name', self._core.user_id)
+        reasoner = GraphReasoner(self._core.graph, user_name=user_name,
+                                 model_dir=model_dir)
+        return reasoner.train(epochs=epochs)
+
+    def reason(self, question: str, model_dir: str = "data/reasoner") -> "ReasoningResult":
+        """
+        Answer a question using the micro-transformer reasoner.
+        Returns ReasoningResult with answer, confidence, and reasoning trace.
+        Falls back gracefully if model not trained.
+        """
+        user_name = getattr(self._core, '_graph_user_name', self._core.user_id)
+        reasoner = GraphReasoner(self._core.graph, user_name=user_name,
+                                 model_dir=model_dir)
+        return reasoner.reason(question)
+
+    # -- Knowledge Graph --
+
+    def get_graph_stats(self) -> dict:
+        """Return knowledge graph statistics."""
+        return self._core.graph.get_stats()
+
+    def get_entities(self) -> list:
+        """Return all entities in the knowledge graph."""
+        return self._core.graph.get_all_entities()
+
+    def get_relations(self, include_inferred: bool = True) -> list:
+        """Return all relations in the knowledge graph."""
+        return self._core.graph.get_all_relations(include_inferred)
+
+    def query_graph(self, question: str) -> dict:
+        """Query the knowledge graph with a natural language question."""
+        return self._core.graph_query.try_answer(question)
+
+    def describe_entity(self, name: str) -> str:
+        """Get a natural language description of an entity."""
+        return self._core.inference_engine.describe_entity(name)
+
+    def get_world_summary(self) -> str:
+        """Get a compact summary of everything known about the user."""
+        return self._core.inference_engine.get_user_world(self._core._graph_user_name)
+
     # -- Inspection --
 
     def get_stats(self) -> dict:
@@ -150,6 +318,14 @@ class Limbiq:
                 {"id": c.id, "topic": c.topic, "memory_count": len(c.memory_ids)}
                 for c in self.get_clusters()
             ],
+            "graph": {
+                "stats": self.get_graph_stats(),
+                "world_summary": self.get_world_summary(),
+                "entities": [
+                    {"id": e.id, "name": e.name, "type": e.entity_type}
+                    for e in self.get_entities()
+                ],
+            },
             "suppressed_count": len(self.get_suppressed()),
             "stats": self.get_stats(),
         }

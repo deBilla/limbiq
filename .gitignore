@@ -8,3 +8,8 @@ build/
 .eggs/
 *.egg
 .env
+.DS_Store
+data/
+neuro_data/
+vectors/
+*.npy

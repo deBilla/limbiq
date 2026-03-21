@@ -26,6 +26,13 @@ from limbiq.signals.gaba import GABASignal
 from limbiq.signals.serotonin import SerotoninSignal
 from limbiq.signals.acetylcholine import AcetylcholineSignal
 from limbiq.signals.norepinephrine import NorepinephrineSignal
+from limbiq.graph.store import GraphStore
+from limbiq.graph.entities import EntityExtractor
+from limbiq.graph.inference import InferenceEngine
+from limbiq.graph.query import GraphQuery
+from limbiq.retrieval.activation_retrieval import (
+    ActivationRetrieval, GraphStateContextBuilder, ScoredMemory,
+)
 
 
 class LimbiqCore:
@@ -37,6 +44,7 @@ class LimbiqCore:
         llm_fn=None,
     ):
         self.llm_fn = llm_fn
+        self.user_id = user_id
         self.store = MemoryStore(store_path, user_id)
         self.embeddings = EmbeddingEngine(embedding_model)
         self.compressor = MemoryCompressor(llm_fn)
@@ -44,6 +52,24 @@ class LimbiqCore:
         self.signal_log = SignalLog(self.store)
         self.rule_store = RuleStore(self.store)
         self.cluster_store = ClusterStore(self.store)
+
+        # Knowledge graph — shares the same SQLite DB
+        self.graph = GraphStore(self.store)
+        self.entity_extractor = EntityExtractor(self.graph, user_id, llm_fn)
+        self.inference_engine = InferenceEngine(self.graph)
+
+        # Resolve actual user name in graph (handles "default" → "Dimuthu" merge)
+        self._graph_user_name = self._resolve_graph_user_name(user_id)
+        self.graph_query = GraphQuery(
+            self.graph, self.inference_engine, self._graph_user_name
+        )
+
+        # Phase 4: activation-weighted retrieval + graph context builder
+        self._activation_retrieval = None  # Lazy init (needs GNN model)
+        self._graph_context_builder = GraphStateContextBuilder(
+            self.graph, self.inference_engine
+        )
+        self._use_activation_retrieval = False  # Enabled after GNN training
 
         # v0.1 signals (detect in observe loop)
         self.signals = [
@@ -62,8 +88,25 @@ class LimbiqCore:
         self._retrieval_config = RetrievalConfig()
         self._pending_ne_events: list[SignalEvent] = []
 
+        # Embedding cache: avoids re-embedding the same message in observe()
+        self._cached_query_text: str | None = None
+        self._cached_query_embedding = None
+
     def process(self, message: str, conversation_history: list[dict] = None) -> ProcessResult:
         query_embedding = self.embeddings.embed(message)
+
+        # Cache for reuse in observe()
+        self._cached_query_text = message
+        self._cached_query_embedding = query_embedding
+
+        # FIRST: try to answer from graph (zero LLM cost, zero extra tokens)
+        graph_answer = self.graph_query.try_answer(message)
+        graph_context = None
+        if graph_answer["answered"] and graph_answer["confidence"] > 0.8:
+            graph_context = graph_answer["answer"]
+
+        # Compact world summary from graph (replaces raw memory dump)
+        world_summary = self.inference_engine.get_user_world(self._graph_user_name)
 
         # Reset retrieval config, then apply any pending norepinephrine effects
         self._retrieval_config.reset()
@@ -81,11 +124,29 @@ class LimbiqCore:
             self.signal_log.log(event)
 
         # Retrieve with current config (possibly widened by norepinephrine)
-        relevant = self.store.search(
-            query_embedding,
-            top_k=self._retrieval_config.top_k,
-            include_suppressed=False,
-        )
+        # Phase 4: use activation-weighted retrieval when available
+        scored_memories = None
+        if self._use_activation_retrieval and self._activation_retrieval:
+            try:
+                scored_memories = self._activation_retrieval.search(
+                    query=message,
+                    query_embedding=query_embedding,
+                    top_k=self._retrieval_config.top_k,
+                )
+                # Convert ScoredMemory -> Memory-like objects for backward compat
+                relevant = self._scored_to_memories(scored_memories)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(f"Activation retrieval failed: {e}")
+                scored_memories = None
+
+        if scored_memories is None:
+            # Fallback to standard embedding-only retrieval
+            relevant = self.store.search(
+                query_embedding,
+                top_k=self._retrieval_config.top_k,
+                include_suppressed=False,
+            )
 
         priority = self.store.get_priority_memories()
         suppressed_ids = {m.id for m in self.store.get_suppressed()}
@@ -105,12 +166,26 @@ class LimbiqCore:
         if cluster:
             clusters_loaded = [cluster.topic]
 
-        context = self.context_builder.build(
-            priority, relevant, suppressed_ids,
-            active_rules=active_rules,
-            cluster_memories=cluster_memories,
-            caution_flag=self._retrieval_config.caution_flag,
-        )
+        # Phase 4: use graph-state context builder when activation retrieval is on
+        if scored_memories is not None:
+            context = self._graph_context_builder.build_context(
+                query=message,
+                scored_memories=scored_memories,
+                world_summary=world_summary,
+                graph_answer=graph_context,
+                active_rules=active_rules,
+                caution_flag=self._retrieval_config.caution_flag,
+            )
+        else:
+            # Fallback to original context builder
+            context = self.context_builder.build(
+                priority, relevant, suppressed_ids,
+                active_rules=active_rules,
+                cluster_memories=cluster_memories,
+                caution_flag=self._retrieval_config.caution_flag,
+                graph_answer=graph_context,
+                world_summary=world_summary,
+            )
 
         return ProcessResult(
             context=context,
@@ -131,9 +206,13 @@ class LimbiqCore:
         self._conversation_buffer.append({"role": "user", "content": message})
         self._conversation_buffer.append({"role": "assistant", "content": response})
 
-        existing_memories = self.store.search(
-            self.embeddings.embed(message), top_k=5
-        )
+        # Reuse cached embedding from process() if same message
+        if message == self._cached_query_text and self._cached_query_embedding is not None:
+            msg_embedding = self._cached_query_embedding
+        else:
+            msg_embedding = self.embeddings.embed(message)
+
+        existing_memories = self.store.search(msg_embedding, top_k=5)
 
         # Run v0.1 signals (dopamine, gaba, norepinephrine detect)
         for signal in self.signals:
@@ -171,9 +250,13 @@ class LimbiqCore:
             self.signal_log.log(event)
             events.append(event)
 
+        # Extract entities and relations from the exchange
+        self.entity_extractor.extract_from_memory(message)
+        self.entity_extractor.extract_from_memory(response)
+
         # Store user message as short-term memory (if substantive)
         if len(message.strip()) > 20:
-            embedding = self.embeddings.embed(message)
+            embedding = msg_embedding
             self.store.store(
                 content=f"User said: {message}",
                 tier=MemoryTier.SHORT,
@@ -183,6 +266,10 @@ class LimbiqCore:
                 metadata={},
                 embedding=embedding,
             )
+
+        # Clear embedding cache
+        self._cached_query_text = None
+        self._cached_query_embedding = None
 
         return events
 
@@ -204,10 +291,17 @@ class LimbiqCore:
                 )
                 results["compressed"] += 1
 
+                # Extract entities from compressed facts (often cleaner than raw)
+                self.entity_extractor.extract_from_memory(fact)
+
             self.store.store_conversation(
                 self._conversation_buffer, self._current_session_id
             )
             self._conversation_buffer = []
+
+        # Run graph inference after all new entities/relations are in
+        inferred = self.inference_engine.run_full_inference()
+        results["graph_inferred"] = inferred
 
         self.store.age_all()
 
@@ -226,6 +320,78 @@ class LimbiqCore:
         results["deleted"] = self.store.delete_old_suppressed(min_sessions=30)
 
         return results
+
+    def _resolve_graph_user_name(self, user_id: str) -> str:
+        """
+        Resolve the actual user entity name in the graph.
+        After Phase 3 entity resolution, "default" may have been merged
+        into the real user name (e.g., "Dimuthu").
+
+        Always picks the person entity with the most outgoing explicit
+        relations — that's the true user node, regardless of whether
+        user_id still exists as an entity.
+        """
+        try:
+            row = self.graph.db.execute(
+                "SELECT e.name, COUNT(r.id) as rel_count "
+                "FROM entities e "
+                "JOIN relations r ON r.subject_id = e.id "
+                "WHERE e.entity_type = 'person' AND r.is_inferred = 0 "
+                "GROUP BY e.id ORDER BY rel_count DESC LIMIT 1"
+            ).fetchone()
+            if row and row[0] and row[1] >= 2:
+                return row[0]
+        except Exception:
+            pass
+
+        # Fallback: check if user_id exists directly
+        entity = self.graph.find_entity_by_name(user_id)
+        if entity:
+            return user_id
+
+        return user_id
+
+    def enable_activation_retrieval(self, gnn_model_dir: str = "data/gnn"):
+        """Enable Phase 4 activation-weighted retrieval."""
+        try:
+            from limbiq.graph.gnn import GNNPropagation
+            gnn = GNNPropagation(
+                store=self.store,
+                graph=self.graph,
+                embedding_engine=self.embeddings,
+                user_name=self.user_id,
+                model_dir=gnn_model_dir,
+            )
+            if gnn.load_model():
+                self._activation_retrieval = ActivationRetrieval(
+                    store=self.store,
+                    graph=self.graph,
+                    embedding_engine=self.embeddings,
+                    gnn_propagation=gnn,
+                    user_name=self._graph_user_name,
+                )
+                self._use_activation_retrieval = True
+                return True
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"Failed to enable activation retrieval: {e}")
+        return False
+
+    def _scored_to_memories(self, scored: list[ScoredMemory]):
+        """Convert ScoredMemory objects to Memory objects for backward compat."""
+        from limbiq.types import Memory, MemoryTier
+        memories = []
+        for sm in scored:
+            # Fetch full memory from store
+            row = self.store.db.execute(
+                "SELECT id, content, tier, confidence, created_at, session_count, "
+                "access_count, is_priority, is_suppressed, suppression_reason, "
+                "source, metadata, embedding FROM memories WHERE id = ?",
+                (sm.memory_id,)
+            ).fetchone()
+            if row:
+                memories.append(self.store._row_to_memory(row))
+        return memories
 
     def start_session(self):
         self._current_session_id = str(uuid.uuid4())[:8]

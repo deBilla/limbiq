@@ -18,8 +18,12 @@ class EmbeddingEngine:
         else:
             try:
                 from sentence_transformers import SentenceTransformer
+                import platform
 
-                self._model = SentenceTransformer(model_name)
+                # Force CPU on Apple Silicon — MPS (Metal) conflicts with MLX
+                # which owns the GPU for LLM inference.
+                device = "cpu" if platform.machine() == "arm64" else None
+                self._model = SentenceTransformer(model_name, device=device)
                 self.embed = self._transformer_embed
                 self._mode = "transformer"
             except ImportError:

@@ -38,6 +38,19 @@ class SteeredModel:
         self.model = model
         self.tokenizer = tokenizer
         self.active_steers: list[dict] = []
+        # Pre-indexed: layer_idx -> [(alpha, vector), ...]
+        self._steers_by_layer: dict[int, list[tuple[float, any]]] = {}
+        self._active_layer_set: set[int] = set()
+
+    def _rebuild_layer_index(self):
+        """Rebuild the per-layer steer index after any steer change."""
+        self._steers_by_layer = {}
+        for steer in self.active_steers:
+            for layer_idx, vec in steer["vectors"].items():
+                if layer_idx not in self._steers_by_layer:
+                    self._steers_by_layer[layer_idx] = []
+                self._steers_by_layer[layer_idx].append((steer["alpha"], vec))
+        self._active_layer_set = set(self._steers_by_layer.keys())
 
     def add_steer(self, name: str, vectors: dict, alpha: float = 1.0):
         """
@@ -55,14 +68,18 @@ class SteeredModel:
             "vectors": vectors,
             "alpha": alpha,
         })
+        self._rebuild_layer_index()
 
     def remove_steer(self, name: str):
         """Remove a steering vector by name."""
         self.active_steers = [s for s in self.active_steers if s["name"] != name]
+        self._rebuild_layer_index()
 
     def clear_steers(self):
         """Remove all active steering vectors."""
         self.active_steers = []
+        self._steers_by_layer = {}
+        self._active_layer_set = set()
 
     def get_active_steers(self) -> list[str]:
         """Return names of all active steers."""
@@ -93,17 +110,11 @@ class SteeredModel:
             mask = mask[None, None, :, :]
 
         for i, (layer, c) in enumerate(zip(self.model.model.layers, cache)):
-            # Determine correct mask for this layer
-            layer_mask = mask
-            h = layer(h, layer_mask, cache=c)
+            h = layer(h, mask, cache=c)
 
-            # Inject steering vectors at this layer
-            for steer in self.active_steers:
-                if i in steer["vectors"]:
-                    vec = steer["vectors"][i]
-                    alpha = steer["alpha"]
-                    # Add scaled vector to ALL token positions
-                    # vec shape: (hidden_dim,) → broadcast to (1, seq_len, hidden_dim)
+            # Only inject at layers that have active steers (skip all others)
+            if i in self._active_layer_set:
+                for alpha, vec in self._steers_by_layer[i]:
                     h = h + alpha * vec
 
         h = self.model.model.norm(h)

@@ -107,7 +107,7 @@ class TestSerotoninCrystallization:
 
         lq.start_session()
         result = lq.process("hello")
-        assert "BEHAVIORAL RULES" in result.context
+        assert "[STYLE]" in result.context
 
     def test_rules_are_deactivatable(self, tmp_dir):
         """Rules can be deactivated if they're wrong."""

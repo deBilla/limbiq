@@ -17,6 +17,8 @@ pip install limbiq[steering-mlx]      # + MLX activation steering (Apple Silicon
 
 ## Quick Start
 
+### As a library
+
 ```python
 from limbiq import Limbiq
 
@@ -47,6 +49,50 @@ lq.observe("What's my wife's name?", response)
 # End session — triggers memory compression + graph inference
 lq.end_session()
 ```
+
+### With the built-in LLM client
+
+Limbiq includes a generic LLM client that works with any OpenAI-compatible API — Ollama, OpenAI, Claude (via proxy), vLLM, LM Studio, etc.
+
+```python
+from limbiq import Limbiq, LLMClient
+
+# Connect to Ollama
+llm = LLMClient(base_url="http://localhost:11434/v1", model="llama3.1")
+
+# Connect to OpenAI
+llm = LLMClient(base_url="https://api.openai.com/v1", model="gpt-4o", api_key="sk-...")
+
+# Pass to Limbiq — enables LLM-powered compression, entity extraction, and pattern detection
+lq = Limbiq(store_path="./data", user_id="dimuthu", llm_fn=llm)
+```
+
+## Playground
+
+Limbiq ships with an interactive web dashboard for exploring the knowledge graph, chatting, and inspecting signals.
+
+```bash
+# Basic — heuristic mode (no LLM needed)
+python -m limbiq.playground
+
+# With Ollama
+python -m limbiq.playground --llm-url http://localhost:11434/v1 --llm-model llama3.1
+
+# With OpenAI
+python -m limbiq.playground --llm-url https://api.openai.com/v1 --llm-model gpt-4o --llm-api-key sk-...
+
+# With any OpenAI-compatible API (vLLM, LM Studio, etc.)
+python -m limbiq.playground --llm-url http://localhost:8000/v1 --llm-model my-model
+```
+
+The playground includes:
+- **Chat** — talk to limbiq and watch it learn in real time (uses LLM if connected)
+- **Knowledge Graph** — interactive D3 visualization of entities and relations
+- **Entity Explorer** — browse entities and their relationships
+- **Query Builder** — test graph queries, memory retrieval, and the reasoner side by side
+- **Traces** — OpenTelemetry trace viewer for debugging
+
+Open `http://localhost:8765` after starting.
 
 ## The Five Signals
 
@@ -141,9 +187,10 @@ lq.export_state()           # Full JSON export for debugging
 
 ## How It Works
 
-- **LLM-agnostic** — works with any LLM (OpenAI, Anthropic, Ollama, llama.cpp, etc.)
+- **LLM-agnostic** — works with any LLM via a unified OpenAI-compatible client (Ollama, OpenAI, Claude, vLLM, LM Studio)
 - **Zero weight modification** — all adaptation through context manipulation and activation steering
 - **Knowledge graph** — entities and relations extracted automatically, inferred transitively
+- **Interactive playground** — web dashboard with chat, graph visualization, and trace viewer
 - **SQLite persistence** — memories, graph, and rules survive across sessions
 - **Semantic search** — sentence-transformers for embedding-based retrieval (TF-IDF fallback)
 - **Transparent** — every signal is logged with trigger, timestamp, and effect

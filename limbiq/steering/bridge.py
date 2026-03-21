@@ -186,7 +186,13 @@ class LimbiqSteeringBridge:
                 return  # One vector per rule
 
 
-def enable_steering(limbiq_instance, model_path: str, vector_dir: str = "./vectors"):
+def enable_steering(
+    limbiq_instance,
+    model_path: str = None,
+    vector_dir: str = "./vectors",
+    model=None,
+    tokenizer=None,
+):
     """
     Enable activation steering on a Limbiq instance.
 
@@ -195,23 +201,31 @@ def enable_steering(limbiq_instance, model_path: str, vector_dir: str = "./vecto
 
     Args:
         limbiq_instance: An existing Limbiq instance
-        model_path: Path to MLX model (local or HF repo)
+        model_path: Path to MLX model (local or HF repo). Ignored if model is provided.
         vector_dir: Directory containing pre-extracted steering vectors
+        model: An already-loaded MLX model instance (avoids loading a second copy)
+        tokenizer: The tokenizer for the pre-loaded model (required if model is provided)
 
     Returns:
         SteeredLimbiq wrapper with generate() method
     """
-    try:
-        from mlx_lm import load as mlx_load
-    except ImportError:
-        raise ImportError(
-            "MLX is required for steering. Install with: pip install limbiq[steering-mlx]"
-        )
-
     from limbiq.steering.inference import SteeredModel
 
-    model, tokenizer = mlx_load(model_path)
-    steered_model = SteeredModel(model, tokenizer)
+    if model is not None:
+        # Use the pre-loaded model — no second load
+        steered_model = SteeredModel(model, tokenizer)
+    elif model_path:
+        try:
+            from mlx_lm import load as mlx_load
+        except ImportError:
+            raise ImportError(
+                "MLX is required for steering. Install with: pip install limbiq[steering-mlx]"
+            )
+        model, tokenizer = mlx_load(model_path)
+        steered_model = SteeredModel(model, tokenizer)
+    else:
+        raise ValueError("Provide either model+tokenizer or model_path")
+
     bridge = LimbiqSteeringBridge(steered_model, vector_dir)
 
     return SteeredLimbiq(limbiq_instance, steered_model, bridge)
