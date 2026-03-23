@@ -3,9 +3,13 @@
 Thread-safe: uses threading.local() for per-thread SQLite connections.
 This is required for multi-threaded frameworks like Gradio where handlers
 run in worker threads separate from the main thread.
+
+Vector search: uses FAISS (if available) for fast approximate nearest
+neighbor search, falling back to numpy brute-force if not installed.
 """
 
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -14,6 +18,21 @@ import time
 import numpy as np
 
 from limbiq.types import Memory, MemoryTier, SuppressionReason
+
+logger = logging.getLogger(__name__)
+
+# Try to import FAISS — optional dependency for fast vector search.
+# On macOS, FAISS and PyTorch both link libomp which can segfault
+# under concurrent threading. We mitigate by setting OMP_NUM_THREADS=1
+# and KMP_DUPLICATE_LIB_OK=TRUE before either library initializes OpenMP.
+_HAS_FAISS = False
+try:
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    import faiss
+    _HAS_FAISS = True
+except ImportError:
+    _HAS_FAISS = False
 
 
 def _serialize_embedding(embedding: list[float] | None) -> bytes | None:
@@ -41,12 +60,29 @@ class MemoryStore:
         self._db_path = os.path.join(store_path, f"{user_id}.db")
         self._init_tables()
 
-        # Embedding cache for vectorized search
-        self._emb_matrix = None  # Cached numpy matrix of all embeddings
-        self._emb_ids = None     # Corresponding memory IDs
-        self._emb_dirty = True   # Invalidation flag
-        self._emb_include_suppressed = None  # Track last include_suppressed value
-        self._emb_lock = threading.Lock()    # Thread-safe cache rebuilds
+        # FAISS vector index (preferred) or numpy fallback
+        self._index_lock = threading.Lock()  # Thread-safe index writes
+
+        if _HAS_FAISS:
+            self._use_faiss = True
+            self._faiss_index = None       # faiss.IndexIDMap wrapping IndexFlatIP
+            self._faiss_dim = None          # Embedding dimension (set on first add)
+            self._id_to_int: dict[str, int] = {}   # UUID str → int64
+            self._int_to_id: dict[int, str] = {}   # int64 → UUID str
+            self._next_int_id = 1
+            self._faiss_path = os.path.join(store_path, f"{user_id}.faiss")
+            self._faiss_map_path = os.path.join(store_path, f"{user_id}.faiss_map.json")
+            self._load_faiss_index()
+            logger.info("FAISS vector index enabled")
+        else:
+            self._use_faiss = False
+            # Numpy fallback state
+            self._emb_matrix = None
+            self._emb_ids = None
+            self._emb_dirty = True
+            self._emb_include_suppressed = None
+            self._emb_lock = threading.Lock()
+            logger.info("FAISS not available, using numpy fallback for vector search")
 
     @property
     def db(self) -> sqlite3.Connection:
@@ -113,6 +149,160 @@ class MemoryStore:
         )
         self.db.commit()
 
+    # ── FAISS index management ─────────────────────────────────
+
+    def _load_faiss_index(self) -> None:
+        """Load FAISS index and ID mapping from disk if they exist."""
+        if not self._use_faiss:
+            return
+
+        if os.path.exists(self._faiss_path) and os.path.exists(self._faiss_map_path):
+            try:
+                self._faiss_index = faiss.read_index(self._faiss_path)
+                with open(self._faiss_map_path, 'r') as f:
+                    map_data = json.load(f)
+                self._id_to_int = map_data.get("id_to_int", {})
+                self._int_to_id = {int(k): v for k, v in map_data.get("int_to_id", {}).items()}
+                self._next_int_id = map_data.get("next_int_id", 1)
+                self._faiss_dim = map_data.get("dim", None)
+                logger.info(
+                    f"Loaded FAISS index: {self._faiss_index.ntotal} vectors, "
+                    f"dim={self._faiss_dim}"
+                )
+                return
+            except Exception as e:
+                logger.warning(f"Failed to load FAISS index, rebuilding: {e}")
+
+        # No saved index — will be built on first add or search
+        self._faiss_index = None
+        self._id_to_int = {}
+        self._int_to_id = {}
+        self._next_int_id = 1
+        self._faiss_dim = None
+
+    def _ensure_faiss_index(self, dim: int) -> None:
+        """Create a FAISS index if one doesn't exist yet."""
+        if self._faiss_index is not None:
+            return
+        # IndexFlatIP = inner product on normalized vectors = cosine similarity
+        base_index = faiss.IndexFlatIP(dim)
+        self._faiss_index = faiss.IndexIDMap(base_index)
+        self._faiss_dim = dim
+
+    def _get_int_id(self, memory_id: str) -> int:
+        """Get or assign an int64 ID for a UUID string."""
+        if memory_id in self._id_to_int:
+            return self._id_to_int[memory_id]
+        int_id = self._next_int_id
+        self._next_int_id += 1
+        self._id_to_int[memory_id] = int_id
+        self._int_to_id[int_id] = memory_id
+        return int_id
+
+    def _faiss_add(self, memory_id: str, embedding: list[float]) -> None:
+        """Add a single embedding to the FAISS index."""
+        emb = np.array(embedding, dtype=np.float32).reshape(1, -1)
+        norm = np.linalg.norm(emb)
+        if norm == 0:
+            return
+        emb = emb / norm
+
+        dim = emb.shape[1]
+        self._ensure_faiss_index(dim)
+
+        # Dimension mismatch — skip (model changed)
+        if self._faiss_dim != dim:
+            logger.warning(
+                f"Embedding dim {dim} != index dim {self._faiss_dim}, skipping add"
+            )
+            return
+
+        int_id = self._get_int_id(memory_id)
+        ids = np.array([int_id], dtype=np.int64)
+        self._faiss_index.add_with_ids(emb, ids)
+
+    def _faiss_remove(self, memory_id: str) -> None:
+        """Remove a single embedding from the FAISS index."""
+        if memory_id not in self._id_to_int:
+            return
+        if self._faiss_index is None:
+            return
+        int_id = self._id_to_int[memory_id]
+        ids = np.array([int_id], dtype=np.int64)
+        self._faiss_index.remove_ids(ids)
+
+    def _rebuild_faiss_from_db(self, include_suppressed: bool = False) -> None:
+        """Rebuild the entire FAISS index from SQLite embeddings."""
+        clause = "" if include_suppressed else "WHERE is_suppressed = 0"
+        cursor = self.db.execute(
+            f"SELECT id, embedding FROM memories {clause}"
+        )
+
+        embeddings = []
+        int_ids = []
+
+        for row_id, emb_bytes in cursor.fetchall():
+            emb = _deserialize_embedding(emb_bytes)
+            if emb is None:
+                continue
+            emb_array = np.array(emb, dtype=np.float32)
+            norm = np.linalg.norm(emb_array)
+            if norm == 0:
+                continue
+            emb_array = emb_array / norm
+            embeddings.append(emb_array)
+            int_ids.append(self._get_int_id(row_id))
+
+        if embeddings:
+            dim = embeddings[0].shape[0]
+            base_index = faiss.IndexFlatIP(dim)
+            self._faiss_index = faiss.IndexIDMap(base_index)
+            self._faiss_dim = dim
+
+            emb_matrix = np.array(embeddings, dtype=np.float32)
+            id_array = np.array(int_ids, dtype=np.int64)
+            self._faiss_index.add_with_ids(emb_matrix, id_array)
+            logger.info(f"Rebuilt FAISS index: {len(embeddings)} vectors, dim={dim}")
+        else:
+            self._faiss_index = None
+            self._faiss_dim = None
+
+    def save_index(self) -> None:
+        """Persist FAISS index and ID mapping to disk."""
+        if not self._use_faiss:
+            return
+        with self._index_lock:
+            if self._faiss_index is None:
+                return
+            try:
+                faiss.write_index(self._faiss_index, self._faiss_path)
+                map_data = {
+                    "id_to_int": self._id_to_int,
+                    "int_to_id": {str(k): v for k, v in self._int_to_id.items()},
+                    "next_int_id": self._next_int_id,
+                    "dim": self._faiss_dim,
+                }
+                with open(self._faiss_map_path, 'w') as f:
+                    json.dump(map_data, f)
+                logger.debug(
+                    f"Saved FAISS index: {self._faiss_index.ntotal} vectors"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to save FAISS index: {e}")
+
+    def invalidate_index(self) -> None:
+        """Invalidate the vector index, forcing a rebuild on next search.
+
+        Use this instead of accessing _emb_dirty directly.
+        """
+        if self._use_faiss:
+            with self._index_lock:
+                self._rebuild_faiss_from_db()
+        else:
+            self._emb_dirty = True
+
+    # ── Core CRUD ──────────────────────────────────────────────
+
     def store(
         self,
         content: str,
@@ -146,12 +336,16 @@ class MemoryStore:
         )
         self.db.commit()
 
-        # Incremental cache update: append to existing cache instead of
-        # triggering a full rebuild (which blocks 50-200ms for 1000 memories)
+        # Update vector index
         if embedding is not None:
-            self._append_to_cache(memory_id, embedding)
+            if self._use_faiss:
+                with self._index_lock:
+                    self._faiss_add(memory_id, embedding)
+            else:
+                self._append_to_cache(memory_id, embedding)
         else:
-            self._emb_dirty = True
+            if not self._use_faiss:
+                self._emb_dirty = True
 
         return Memory(
             id=memory_id,
@@ -164,79 +358,33 @@ class MemoryStore:
             metadata=metadata or {},
         )
 
-    def _append_to_cache(self, memory_id: str, embedding: list[float]) -> None:
-        """Incrementally append a single embedding to the cache without full rebuild."""
-        with self._emb_lock:
-            # Only append if cache is initialized and not dirty
-            # (if dirty, next search will do a full rebuild anyway)
-            if self._emb_dirty or self._emb_matrix is None:
-                self._emb_dirty = True
-                return
-
-            # Skip if include_suppressed tracking would be wrong
-            # (new memories are never suppressed, so this is safe for both modes)
-            emb_array = np.array(embedding, dtype=np.float32)
-            norm = np.linalg.norm(emb_array)
-            if norm == 0:
-                return
-            emb_array = emb_array / norm
-
-            # Check dimension compatibility
-            if self._emb_matrix.shape[1] != emb_array.shape[0]:
-                self._emb_dirty = True
-                return
-
-            self._emb_matrix = np.vstack([self._emb_matrix, emb_array.reshape(1, -1)])
-            self._emb_ids = np.append(self._emb_ids, memory_id)
-
     def search(
         self,
         query_embedding: list[float],
         top_k: int = 10,
         include_suppressed: bool = False,
     ) -> list[Memory]:
-        """Search memories by embedding similarity using vectorized numpy computation."""
-        # Rebuild cache if dirty, uninitialized, or include_suppressed flag changed
-        if self._emb_dirty or self._emb_matrix is None or self._emb_include_suppressed != include_suppressed:
-            self._rebuild_embedding_cache(include_suppressed)
+        """Search memories by embedding similarity."""
+        if self._use_faiss:
+            return self._search_faiss(query_embedding, top_k, include_suppressed)
+        else:
+            return self._search_numpy(query_embedding, top_k, include_suppressed)
 
-        # Return empty if no embeddings available
-        if self._emb_matrix is None or len(self._emb_matrix) == 0:
-            return []
+    def search_with_scores(
+        self,
+        query_embedding: list[float],
+        top_k: int = 10,
+        include_suppressed: bool = False,
+    ) -> list[tuple[str, float]]:
+        """Search and return (memory_id, similarity_score) pairs.
 
-        # Normalize query embedding
-        query = np.array(query_embedding, dtype=np.float32)
-        query_norm = np.linalg.norm(query)
-        if query_norm == 0:
-            return []
-        query = query / query_norm
-
-        # Handle dimension mismatch (e.g. model changed since embeddings were stored)
-        cache_dim = self._emb_matrix.shape[1]
-        query_dim = query.shape[0]
-        if cache_dim != query_dim:
-            # Invalidate cache and fall back to row-by-row search
-            self._emb_dirty = True
-            self._emb_matrix = None
-            self._emb_ids = None
-            return self._search_fallback(query_embedding, top_k, include_suppressed)
-
-        # Batch cosine similarity (matrix already normalized in cache)
-        sims = self._emb_matrix @ query
-
-        # Get top-k indices by similarity
-        top_indices = np.argsort(sims)[-top_k:][::-1]
-
-        results = []
-        for idx in top_indices:
-            if sims[idx] <= 0:
-                break
-            mem_id = self._emb_ids[idx]
-            mem = self._get_memory_by_id(mem_id)
-            if mem:
-                results.append(mem)
-
-        return results
+        Used by ActivationRetrieval to get embedding similarities without
+        re-computing them from raw embeddings.
+        """
+        if self._use_faiss:
+            return self._search_faiss_with_scores(query_embedding, top_k, include_suppressed)
+        else:
+            return self._search_numpy_with_scores(query_embedding, top_k, include_suppressed)
 
     def get_priority_memories(self) -> list[Memory]:
         cursor = self.db.execute(
@@ -263,7 +411,12 @@ class MemoryStore:
             (reason_val, memory_id),
         )
         self.db.commit()
-        self._emb_dirty = True
+
+        if self._use_faiss:
+            with self._index_lock:
+                self._faiss_remove(memory_id)
+        else:
+            self._emb_dirty = True
 
     def restore(self, memory_id: str) -> None:
         self.db.execute(
@@ -272,7 +425,20 @@ class MemoryStore:
             (memory_id,),
         )
         self.db.commit()
-        self._emb_dirty = True
+
+        if self._use_faiss:
+            # Re-add embedding to index
+            cursor = self.db.execute(
+                "SELECT embedding FROM memories WHERE id = ?", (memory_id,)
+            )
+            row = cursor.fetchone()
+            if row and row[0]:
+                emb = _deserialize_embedding(row[0])
+                if emb:
+                    with self._index_lock:
+                        self._faiss_add(memory_id, emb)
+        else:
+            self._emb_dirty = True
 
     def age_all(self) -> None:
         self.db.execute("UPDATE memories SET session_count = session_count + 1")
@@ -302,7 +468,7 @@ class MemoryStore:
             (new_confidence, memory_id),
         )
         self.db.commit()
-        self._emb_dirty = True
+        # Confidence changes don't affect the vector index — no invalidation needed
 
     def get_stale(self, min_sessions: int = 10) -> list[Memory]:
         cursor = self.db.execute(
@@ -316,12 +482,27 @@ class MemoryStore:
         return [self._row_to_memory(row) for row in cursor.fetchall()]
 
     def delete_old_suppressed(self, min_sessions: int = 30) -> int:
+        # Get IDs before deleting so we can remove from FAISS
+        if self._use_faiss:
+            cursor = self.db.execute(
+                "SELECT id FROM memories WHERE is_suppressed = 1 AND session_count >= ?",
+                (min_sessions,),
+            )
+            ids_to_delete = [row[0] for row in cursor.fetchall()]
+
         cursor = self.db.execute(
             "DELETE FROM memories WHERE is_suppressed = 1 AND session_count >= ?",
             (min_sessions,),
         )
         self.db.commit()
-        self._emb_dirty = True
+
+        if self._use_faiss:
+            with self._index_lock:
+                for mid in ids_to_delete:
+                    self._faiss_remove(mid)
+        else:
+            self._emb_dirty = True
+
         return cursor.rowcount
 
     def store_conversation(self, messages: list[dict], session_id: str = None) -> None:
@@ -393,6 +574,155 @@ class MemoryStore:
 
         return {"user_id": self.user_id, "memories": memories}
 
+    # ── FAISS search implementation ────────────────────────────
+
+    def _search_faiss(
+        self,
+        query_embedding: list[float],
+        top_k: int = 10,
+        include_suppressed: bool = False,
+    ) -> list[Memory]:
+        """Search using FAISS index."""
+        scored = self._search_faiss_with_scores(query_embedding, top_k, include_suppressed)
+        results = []
+        for mem_id, score in scored:
+            mem = self._get_memory_by_id(mem_id)
+            if mem:
+                results.append(mem)
+        return results
+
+    def _search_faiss_with_scores(
+        self,
+        query_embedding: list[float],
+        top_k: int = 10,
+        include_suppressed: bool = False,
+    ) -> list[tuple[str, float]]:
+        """Search FAISS and return (memory_id, similarity) pairs."""
+        # Build index if not yet initialized
+        if self._faiss_index is None or self._faiss_index.ntotal == 0:
+            with self._index_lock:
+                self._rebuild_faiss_from_db(include_suppressed)
+            if self._faiss_index is None or self._faiss_index.ntotal == 0:
+                return []
+
+        query = np.array(query_embedding, dtype=np.float32).reshape(1, -1)
+        query_norm = np.linalg.norm(query)
+        if query_norm == 0:
+            return []
+        query = query / query_norm
+
+        # Dimension mismatch check
+        if self._faiss_dim and query.shape[1] != self._faiss_dim:
+            return self._search_fallback_with_scores(
+                query_embedding, top_k, include_suppressed
+            )
+
+        k = min(top_k, self._faiss_index.ntotal)
+        distances, ids = self._faiss_index.search(query, k)
+
+        results = []
+        for i in range(k):
+            int_id = int(ids[0][i])
+            score = float(distances[0][i])
+            if int_id == -1 or score <= 0:
+                continue
+            mem_id = self._int_to_id.get(int_id)
+            if mem_id:
+                results.append((mem_id, score))
+
+        # If not including suppressed, filter out suppressed memories
+        if not include_suppressed and results:
+            suppressed_ids = self._get_suppressed_ids()
+            results = [(mid, s) for mid, s in results if mid not in suppressed_ids]
+
+        return results
+
+    def _get_suppressed_ids(self) -> set[str]:
+        """Get set of suppressed memory IDs."""
+        cursor = self.db.execute("SELECT id FROM memories WHERE is_suppressed = 1")
+        return {row[0] for row in cursor.fetchall()}
+
+    # ── Numpy fallback search ──────────────────────────────────
+
+    def _search_numpy(
+        self,
+        query_embedding: list[float],
+        top_k: int = 10,
+        include_suppressed: bool = False,
+    ) -> list[Memory]:
+        """Search memories using numpy vectorized computation (fallback when FAISS unavailable)."""
+        if self._emb_dirty or self._emb_matrix is None or self._emb_include_suppressed != include_suppressed:
+            self._rebuild_embedding_cache(include_suppressed)
+
+        if self._emb_matrix is None or len(self._emb_matrix) == 0:
+            return []
+
+        query = np.array(query_embedding, dtype=np.float32)
+        query_norm = np.linalg.norm(query)
+        if query_norm == 0:
+            return []
+        query = query / query_norm
+
+        cache_dim = self._emb_matrix.shape[1]
+        query_dim = query.shape[0]
+        if cache_dim != query_dim:
+            self._emb_dirty = True
+            self._emb_matrix = None
+            self._emb_ids = None
+            return self._search_fallback(query_embedding, top_k, include_suppressed)
+
+        sims = self._emb_matrix @ query
+        top_indices = np.argsort(sims)[-top_k:][::-1]
+
+        results = []
+        for idx in top_indices:
+            if sims[idx] <= 0:
+                break
+            mem_id = self._emb_ids[idx]
+            mem = self._get_memory_by_id(mem_id)
+            if mem:
+                results.append(mem)
+
+        return results
+
+    def _search_numpy_with_scores(
+        self,
+        query_embedding: list[float],
+        top_k: int = 10,
+        include_suppressed: bool = False,
+    ) -> list[tuple[str, float]]:
+        """Numpy search returning (memory_id, similarity) pairs."""
+        if self._emb_dirty or self._emb_matrix is None or self._emb_include_suppressed != include_suppressed:
+            self._rebuild_embedding_cache(include_suppressed)
+
+        if self._emb_matrix is None or len(self._emb_matrix) == 0:
+            return []
+
+        query = np.array(query_embedding, dtype=np.float32)
+        query_norm = np.linalg.norm(query)
+        if query_norm == 0:
+            return []
+        query = query / query_norm
+
+        cache_dim = self._emb_matrix.shape[1]
+        query_dim = query.shape[0]
+        if cache_dim != query_dim:
+            self._emb_dirty = True
+            self._emb_matrix = None
+            self._emb_ids = None
+            return self._search_fallback_with_scores(query_embedding, top_k, include_suppressed)
+
+        sims = self._emb_matrix @ query
+        top_indices = np.argsort(sims)[-top_k:][::-1]
+
+        results = []
+        for idx in top_indices:
+            if sims[idx] <= 0:
+                break
+            results.append((self._emb_ids[idx], float(sims[idx])))
+
+        return results
+
     def _search_fallback(
         self,
         query_embedding: list[float],
@@ -400,6 +730,21 @@ class MemoryStore:
         include_suppressed: bool = False,
     ) -> list[Memory]:
         """Row-by-row cosine similarity search — used when dimensions mismatch."""
+        scored = self._search_fallback_with_scores(query_embedding, top_k, include_suppressed)
+        results = []
+        for mem_id, _ in scored:
+            mem = self._get_memory_by_id(mem_id)
+            if mem:
+                results.append(mem)
+        return results
+
+    def _search_fallback_with_scores(
+        self,
+        query_embedding: list[float],
+        top_k: int = 10,
+        include_suppressed: bool = False,
+    ) -> list[tuple[str, float]]:
+        """Row-by-row cosine similarity returning (memory_id, score) pairs."""
         clause = "" if include_suppressed else "WHERE is_suppressed = 0"
         cursor = self.db.execute(
             f"SELECT id, embedding FROM memories {clause}"
@@ -426,15 +771,32 @@ class MemoryStore:
                 scored.append((row_id, sim))
 
         scored.sort(key=lambda x: x[1], reverse=True)
-        results = []
-        for mem_id, _ in scored[:top_k]:
-            mem = self._get_memory_by_id(mem_id)
-            if mem:
-                results.append(mem)
-        return results
+        return scored[:top_k]
+
+    # ── Numpy cache management (fallback only) ─────────────────
+
+    def _append_to_cache(self, memory_id: str, embedding: list[float]) -> None:
+        """Incrementally append a single embedding to the numpy cache."""
+        with self._emb_lock:
+            if self._emb_dirty or self._emb_matrix is None:
+                self._emb_dirty = True
+                return
+
+            emb_array = np.array(embedding, dtype=np.float32)
+            norm = np.linalg.norm(emb_array)
+            if norm == 0:
+                return
+            emb_array = emb_array / norm
+
+            if self._emb_matrix.shape[1] != emb_array.shape[0]:
+                self._emb_dirty = True
+                return
+
+            self._emb_matrix = np.vstack([self._emb_matrix, emb_array.reshape(1, -1)])
+            self._emb_ids = np.append(self._emb_ids, memory_id)
 
     def _rebuild_embedding_cache(self, include_suppressed: bool = False) -> None:
-        """Rebuild the normalized embedding matrix cache."""
+        """Rebuild the normalized embedding matrix cache (numpy fallback)."""
         with self._emb_lock:
             clause = "" if include_suppressed else "WHERE is_suppressed = 0"
             cursor = self.db.execute(
@@ -449,7 +811,6 @@ class MemoryStore:
                 if emb is None:
                     continue
 
-                # Normalize embedding
                 emb_array = np.array(emb, dtype=np.float32)
                 norm = np.linalg.norm(emb_array)
                 if norm > 0:
@@ -466,6 +827,8 @@ class MemoryStore:
 
             self._emb_dirty = False
             self._emb_include_suppressed = include_suppressed
+
+    # ── Internal helpers ───────────────────────────────────────
 
     def _get_memory_by_id(self, memory_id: str) -> Memory | None:
         """Retrieve a single memory by ID."""

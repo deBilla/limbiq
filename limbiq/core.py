@@ -383,6 +383,9 @@ class LimbiqCore:
 
         results["deleted"] = self.store.delete_old_suppressed(min_sessions=30)
 
+        # Persist FAISS index to disk
+        self.store.save_index()
+
         return results
 
     # ── Graph self-healing: connectivity bridging ──────────────

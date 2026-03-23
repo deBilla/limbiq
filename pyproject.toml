@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "limbiq"
-version = "0.5.0"
+version = "0.5.1"
 description = "Neurotransmitter-inspired adaptive learning layer for LLMs"
 readme = "README.md"
 license = "MIT"
@@ -39,6 +39,9 @@ playground = [
     "uvicorn>=0.20.0",
     "pydantic>=2.0.0",
 ]
+faiss = [
+    "faiss-cpu>=1.7.0",
+]
 steering-mlx = [
     "mlx>=0.5.0",
     "mlx-lm>=0.4.0",
@@ -59,7 +62,7 @@ include = ["limbiq*"]
 limbiq = ["py.typed"]
 
 [tool.setuptools.exclude-package-data]
-"*" = ["*.db", "*.npy", ".DS_Store"]
+"*" = ["*.db", "*.npy", "*.faiss", "*.faiss_map.json", ".DS_Store"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -63,7 +63,7 @@ class ActivationRetrieval:
         Retrieve memories using activation-weighted scoring.
 
         Steps:
-        1. Compute embedding similarity (existing path)
+        1. Compute embedding similarity via store's vector index
         2. Get GNN activations biased toward query
         3. Compute graph entity relevance boost
         4. Blend scores and return top-k
@@ -71,55 +71,35 @@ class ActivationRetrieval:
         if query_embedding is None:
             query_embedding = self.embeddings.embed(query)
 
-        # Step 1: Get all candidate memories with embedding similarity
-        from limbiq.store.memory_store import _deserialize_embedding
-        clause = "" if include_suppressed else "WHERE is_suppressed = 0"
-        cursor = self.store.db.execute(
-            f"SELECT id, content, tier, confidence, is_priority, is_suppressed, "
-            f"embedding FROM memories {clause}"
+        # Step 1: Get embedding similarities from store's vector index
+        # (uses FAISS if available, numpy fallback otherwise)
+        # Fetch more candidates than top_k since blending may reorder
+        candidate_k = min(top_k * 3, 100)
+        scored_pairs = self.store.search_with_scores(
+            query_embedding, top_k=candidate_k,
+            include_suppressed=include_suppressed,
         )
 
-        # Collect all candidates and embeddings
-        rows = cursor.fetchall()
-        embs = []
-        valid_rows = []
-        for row in rows:
-            emb = _deserialize_embedding(row[6])
-            if emb is not None:
-                embs.append(emb)
-                valid_rows.append(row)
-
-        if not embs:
+        if not scored_pairs:
             return []
 
-        # Batch cosine similarity using numpy
-        emb_matrix = np.array(embs, dtype=np.float32)
-        query_vec = np.array(query_embedding, dtype=np.float32)
-
-        # Normalize embeddings
-        emb_norms = np.linalg.norm(emb_matrix, axis=1, keepdims=True)
-        emb_norms = np.maximum(emb_norms, 1e-8)
-        emb_matrix = emb_matrix / emb_norms
-
-        # Normalize query
-        query_norm = np.linalg.norm(query_vec)
-        if query_norm == 0:
-            return []
-        query_vec = query_vec / query_norm
-
-        # Compute all similarities at once
-        sims = emb_matrix @ query_vec
-
+        # Load memory metadata for candidates
         candidates = []
-        for i, row in enumerate(valid_rows):
-            candidates.append({
-                "id": row[0],
-                "content": row[1],
-                "tier": row[2],
-                "confidence": row[3],
-                "is_priority": bool(row[4]),
-                "embedding_sim": max(0.0, float(sims[i])),
-            })
+        for mem_id, sim_score in scored_pairs:
+            row = self.store.db.execute(
+                "SELECT id, content, tier, confidence, is_priority "
+                "FROM memories WHERE id = ?",
+                (mem_id,),
+            ).fetchone()
+            if row:
+                candidates.append({
+                    "id": row[0],
+                    "content": row[1],
+                    "tier": row[2],
+                    "confidence": row[3],
+                    "is_priority": bool(row[4]),
+                    "embedding_sim": max(0.0, sim_score),
+                })
 
         # Step 2: Get GNN activations (query-biased)
         activation_map = {}

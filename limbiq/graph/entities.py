@@ -193,9 +193,65 @@ INVALID_ENTITY_NAMES = (
 )
 
 
+def _levenshtein_distance(a: str, b: str) -> int:
+    """Compute Levenshtein edit distance between two strings."""
+    if len(a) < len(b):
+        return _levenshtein_distance(b, a)
+    if len(b) == 0:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a):
+        curr = [i + 1]
+        for j, cb in enumerate(b):
+            cost = 0 if ca == cb else 1
+            curr.append(min(curr[j] + 1, prev[j + 1] + 1, prev[j] + cost))
+        prev = curr
+    return prev[-1]
+
+
+def _fuzzy_match_predicate(word: str) -> str | None:
+    """Find the closest valid predicate within Levenshtein distance 1.
+
+    Only attempts fuzzy matching for words with length >= 4 to avoid
+    false positives on short words (e.g. "pet" matching "set").
+    Returns the matched predicate or None if no close match.
+    """
+    if len(word) < 4:
+        return None
+
+    candidates = list(VALID_PREDICATES) + list(RELATION_ALIASES.keys())
+    best_match = None
+    best_dist = 2  # Only accept distance <= 1
+
+    for candidate in candidates:
+        # Skip candidates with very different lengths (can't be dist ≤ 1)
+        if abs(len(candidate) - len(word)) > 1:
+            continue
+        dist = _levenshtein_distance(word, candidate)
+        if dist < best_dist:
+            best_dist = dist
+            best_match = candidate
+
+    if best_match is None:
+        return None
+
+    # Resolve through aliases if the match was an alias key
+    resolved = RELATION_ALIASES.get(best_match, best_match)
+    logger.info(f"Fuzzy predicate match: '{word}' → '{resolved}' (distance={best_dist})")
+    return resolved
+
+
 def _normalize_predicate(pred: str) -> str:
     p = pred.lower().strip().replace("-", "_").replace(" ", "_")
-    return RELATION_ALIASES.get(p, p)
+    result = RELATION_ALIASES.get(p, p)
+    # If exact match found in VALID_PREDICATES or aliases, return it
+    if result in VALID_PREDICATES:
+        return result
+    # Try fuzzy matching for typos (distance ≤ 1)
+    fuzzy = _fuzzy_match_predicate(p)
+    if fuzzy:
+        return fuzzy
+    return result
 
 
 def _is_valid_entity_name(name: str) -> bool:

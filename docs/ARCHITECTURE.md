@@ -1,6 +1,6 @@
 # Limbiq Architecture
 
-> Neurotransmitter-inspired adaptive learning layer for LLMs (v0.6.0)
+> Neurotransmitter-inspired adaptive learning layer for LLMs (v0.5.1)
 
 Limbiq sits between the user and any LLM, enriching context with learned memories, behavioral rules, knowledge graph facts, and signal-driven adaptations — all without modifying model weights.
 
@@ -67,7 +67,7 @@ limbiq/
 ├── core.py                  # Orchestrator — process(), observe(), end_session()
 ├── types.py                 # All dataclasses and enums
 ├── store/                   # SQLite persistence + embeddings
-│   ├── memory_store.py      # CRUD for memories, vectorized similarity search
+│   ├── memory_store.py      # CRUD for memories, FAISS vector search (numpy fallback)
 │   ├── embeddings.py        # Text → vector embeddings
 │   ├── cluster_store.py     # Acetylcholine knowledge clusters
 │   ├── rule_store.py        # Serotonin behavioral rules
@@ -107,7 +107,7 @@ Persistence and embedding-based retrieval. All stores share one SQLite database.
 
 | Module | Purpose | Key Dependencies |
 |--------|---------|-----------------|
-| `memory_store.py` | CRUD for memories, vectorized similarity search with numpy cache | numpy, sqlite3 |
+| `memory_store.py` | CRUD for memories, vector search via FAISS (numpy fallback) | faiss-cpu (opt), numpy, sqlite3 |
 | `embeddings.py` | Text → vector embeddings with thread-safe LRU cache | sentence-transformers (TF-IDF fallback) |
 | `cluster_store.py` | Acetylcholine knowledge clusters | memory_store (shared DB) |
 | `rule_store.py` | Serotonin behavioral rules & pattern observations | memory_store (shared DB) |
@@ -118,6 +118,10 @@ Persistence and embedding-based retrieval. All stores share one SQLite database.
 - `signal_log` — signal event history
 - `conversations` — raw conversation logs
 - `sessions` — session metadata
+
+**Persistence files (created by `memory_store.py`):**
+- `{user_id}.faiss` — FAISS vector index (binary, created by `save_index()`)
+- `{user_id}.faiss_map.json` — UUID ↔ int64 ID mapping for FAISS
 
 **SQLite Tables (created by sub-stores):**
 - `knowledge_clusters` — acetylcholine topic clusters (cluster_store.py)
@@ -166,7 +170,7 @@ Knowledge graph with entity extraction, deterministic inference, and five neural
 
 | Module | Purpose | Key Dependencies |
 |--------|---------|-----------------|
-| `activation_retrieval.py` | Phase 4: hybrid scoring `α*emb_sim + β*gnn_act + γ*graph_boost` | numpy, memory_store (lazy) |
+| `activation_retrieval.py` | Phase 4: hybrid scoring `α*emb_sim + β*gnn_act + γ*graph_boost` | memory_store.search_with_scores() |
 
 Also provides `GraphStateContextBuilder` — builds enriched context when GNN retrieval is active, and `GraphTrainingDataGenerator` — exports graph QA pairs as JSONL.
 
@@ -282,8 +286,8 @@ User Message
     │     └─ Cosine similarity < 0.3 with previous embedding
     │
     ├─5─→ Retrieve memories                    (activation_retrieval.py or memory_store.py)
-    │     ├─ Phase 4 (GNN-weighted) if enabled
-    │     └─ Fallback: vectorized cosine similarity search
+    │     ├─ Phase 4 (GNN-weighted) if enabled — uses store.search_with_scores()
+    │     └─ Fallback: FAISS index.search() or numpy cosine similarity
     │
     ├─6─→ Increment access counts              (memory_store.py batch)
     │
@@ -366,7 +370,9 @@ Session End
     ├─6─→ Suppress stale memories (10+ sessions, never accessed)
     │     └─ Creates GABA event (never_accessed)
     │
-    └─7─→ Delete old suppressed (30+ sessions)
+    ├─7─→ Delete old suppressed (30+ sessions)
+    │
+    └─8─→ Persist FAISS index to disk             (memory_store.save_index)
               │
               ▼
          { compressed, aged, suppressed, deleted, graph_inferred, entities_merged }
@@ -620,11 +626,50 @@ The entire system shares **one SQLite database file** via `MemoryStore`.
       memory_   cluster_  rule_ signal_ graph/    graph/     graph/
       store     store     store  log    store   propagation  pattern_
                                                            completion
+
+                    ┌─────────────────────────┐
+                    │   FAISS Vector Index     │
+                    │  ({user_id}.faiss)       │
+                    │  ({user_id}.faiss_map)   │
+                    └────────────┬────────────┘
+                                 │
+                    ┌────────────┼────────────┐
+                    │   _index_lock (Lock)    │
+                    │   thread-safe writes    │
+                    └────────────┬────────────┘
+                                 │
+                        ┌────────┼────────┐
+                        ▼                 ▼
+                   memory_store    activation_
+                   .search()       retrieval
+                                   .search()
 ```
 
 **Thread safety:** `MemoryStore` uses `threading.local()` for per-thread `sqlite3.Connection` instances. All sub-stores access the database through `self._store.db`, which returns the calling thread's connection. This makes Limbiq safe for FastAPI, Gradio, and other async/threaded frameworks.
 
-**Embedding cache:** `MemoryStore` maintains a numpy matrix cache (`_emb_matrix`) for vectorized cosine similarity. Thread-safe via `threading.Lock` (`_emb_lock`). Incremental updates on `store()`, full rebuild on invalidation.
+**Vector search index:** `MemoryStore` uses FAISS `IndexIDMap(IndexFlatIP)` for fast inner-product search on normalized embeddings (equivalent to cosine similarity). Thread-safe writes via `threading.Lock` (`_index_lock`). Falls back to numpy brute-force matrix search if `faiss-cpu` is not installed.
+
+```
+Vector Search Architecture:
+┌─────────────────────────────────────────────────────────┐
+│                    MemoryStore                           │
+│                                                         │
+│  store() ──→ SQLite (embedding BLOB) + FAISS index.add │
+│  search() ──→ FAISS index.search(query, top_k) ─→ IDs │
+│  search_with_scores() ──→ (memory_id, similarity) pairs │
+│  suppress() ──→ SQLite UPDATE + FAISS index.remove_ids │
+│  save_index() ──→ faiss.write_index({user_id}.faiss)   │
+│  invalidate_index() ──→ rebuild from SQLite embeddings  │
+│                                                         │
+│  Fallback (no FAISS): numpy _emb_matrix cache           │
+│    - Lazy rebuild on _emb_dirty flag                    │
+│    - Incremental _append_to_cache on store()            │
+└─────────────────────────────────────────────────────────┘
+```
+
+**FAISS ID mapping:** FAISS requires int64 IDs. `MemoryStore` maintains a bidirectional `UUID str ↔ int64` mapping persisted as `{user_id}.faiss_map.json` alongside the index file `{user_id}.faiss`.
+
+**macOS OpenMP compatibility:** FAISS and PyTorch both link libomp. To prevent segfaults under concurrent threading, `memory_store.py` sets `OMP_NUM_THREADS=1` and `KMP_DUPLICATE_LIB_OK=TRUE` before importing FAISS.
 
 **Concurrency in core.py:**
 - `process()`: 4-worker `ThreadPoolExecutor` for graph query + world summary + graph context + priority memories
@@ -645,6 +690,7 @@ The entire system shares **one SQLite database file** via `MemoryStore`.
 
 | Package | Used By | Purpose | Fallback |
 |---------|---------|---------|----------|
+| faiss-cpu | memory_store.py | FAISS vector index for fast ANN search | numpy brute-force cosine similarity |
 | torch | gnn.py, pattern_completion.py, reasoning.py, encoder.py | Neural graph operations | Phases 2-5 skip, regex-only extraction |
 | spacy | entities.py | Tier 1 dep parsing + NER (en_core_web_sm) | Regex patterns only (no dep tree) |
 | fastapi | playground/server.py, playground/api.py | REST API + web dashboard | Playground unavailable |
@@ -656,6 +702,7 @@ The entire system shares **one SQLite database file** via `MemoryStore`.
 
 ```bash
 pip install -e ".[dev]"           # Core + dev dependencies (pytest)
+pip install -e ".[faiss]"         # + FAISS vector search (recommended)
 pip install -e ".[playground]"    # + FastAPI web dashboard
 ```
 
@@ -679,7 +726,7 @@ __init__.py (facade)
             ├──→ types.py (foundation — no limbiq imports)
             │
             ├──→ Store Layer
-            │     ├── memory_store.py ──→ types, numpy
+            │     ├── memory_store.py ──→ types, numpy, faiss (opt → numpy fallback)
             │     ├── embeddings.py ──→ sentence-transformers (or TF-IDF fallback)
             │     ├── cluster_store.py ──→ types (receives memory_store via __init__)
             │     ├── rule_store.py ──→ types (receives memory_store via __init__)
@@ -705,7 +752,7 @@ __init__.py (facade)
             │     └── reasoning.py ──→ graph/store, torch, numpy
             │
             ├──→ Retrieval Layer
-            │     └── activation_retrieval.py ──→ numpy, memory_store (lazy)
+            │     └── activation_retrieval.py ──→ memory_store.search_with_scores()
             │
             └──→ context/builder.py ──→ types
 ```
@@ -774,4 +821,4 @@ All other modules have 0-2 internal dependencies.
 
 ---
 
-*Updated 2026-03-23. Full codebase scan of 35 `.py` files (28 modules + 7 `__init__.py`) in `limbiq/`. No circular dependencies found. Entity extraction updated to hybrid dep-parse pipeline (Tier 1: spaCy deps, Tier 2: LLM tie-break, Fallback: regex). Playground v0.6 (28 endpoints, openai SDK, specific-origin CORS).*
+*Updated 2026-03-23. FAISS vector search integration: `memory_store.py` uses `faiss.IndexIDMap(IndexFlatIP)` for fast inner-product search with numpy fallback. `activation_retrieval.py` delegates to `store.search_with_scores()` instead of building its own matrix. FAISS index persisted via `save_index()` in `end_session()`. `gnn.py` uses `store.invalidate_index()` public API. `faiss-cpu` added as optional dependency. macOS OpenMP compatibility handled via `OMP_NUM_THREADS=1`.*

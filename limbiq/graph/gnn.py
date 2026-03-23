@@ -688,7 +688,7 @@ class GNNPropagation:
                         (feat.memory_id,)
                     )
                     self.store.db.commit()
-                    self.store._emb_dirty = True
+                    self.store.invalidate_index()
                     priority_deflated += 1
 
         # 3. Merge duplicates using GNN merge embeddings
