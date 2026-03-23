@@ -1,6 +1,6 @@
 """Pydantic models for the playground API."""
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import Optional, Any
 
 
@@ -20,6 +20,10 @@ class ObserveRequest(BaseModel):
 class TrainRequest(BaseModel):
     epochs: int = 500
     model_dir: Optional[str] = None
+
+
+class TrainEncoderRequest(BaseModel):
+    epochs: int = 50
 
 
 # ─── Graph Models ─────────────────────────────────────────────
@@ -85,6 +89,14 @@ class StatsResponse(BaseModel):
     uptime_seconds: float = 0
 
 
+class ConnectivityResponse(BaseModel):
+    components: int = 0
+    entities: int = 0
+    relations: int = 0
+    fully_connected: bool = True
+    component_sizes: list[int] = []
+
+
 class ProfileResponse(BaseModel):
     user_name: str = ""
     world_summary: str = ""
@@ -102,7 +114,7 @@ class TrainResponse(BaseModel):
     duration_ms: float = 0
 
 
-class SignalEvent(BaseModel):
+class SignalEventModel(BaseModel):
     signal_type: str
     trigger: str
     timestamp: float

@@ -28,6 +28,10 @@ class NorepinephrineSignal(BaseSignal):
     def __init__(self):
         self._previous_embedding: list[float] | None = None
 
+    def reset(self):
+        """Clear state between sessions to avoid spurious topic shift on first message."""
+        self._previous_embedding = None
+
     @property
     def signal_type(self) -> str:
         return SignalType.NOREPINEPHRINE
@@ -96,10 +100,6 @@ class NorepinephrineSignal(BaseSignal):
                 )
 
         self._previous_embedding = query_embedding
-
-        # Apply widened retrieval for any norepinephrine event
-        if events:
-            retrieval_config.widen()
 
         return events
 

@@ -23,10 +23,10 @@ class GraphQuery:
     """
 
     RELATIONSHIP_PATTERNS = [
-        r"who\s+is\s+(\w+)\s+to\s+(?:my\s+)?(\w+)",
-        r"how\s+is\s+(\w+)\s+related\s+to\s+(\w+)",
-        r"what\s+is\s+(\w+)\s+to\s+(?:my\s+)?(\w+)",
-        r"relationship\s+between\s+(\w+)\s+and\s+(\w+)",
+        r"who\s+is\s+(\w+(?:\s+[A-Z]\w+)*)\s+to\s+(?:my\s+)?(\w+)",
+        r"how\s+is\s+(\w+(?:\s+[A-Z]\w+)*)\s+related\s+to\s+(\w+(?:\s+[A-Z]\w+)*)",
+        r"what\s+is\s+(\w+(?:\s+[A-Z]\w+)*)\s+to\s+(?:my\s+)?(\w+)",
+        r"relationship\s+between\s+(\w+(?:\s+[A-Z]\w+)*)\s+and\s+(\w+(?:\s+[A-Z]\w+)*)",
     ]
 
     FACT_QUERY_PATTERNS = [
@@ -40,14 +40,19 @@ class GraphQuery:
     ]
 
     ENTITY_QUERY_PATTERNS = [
-        r"(?:who|what)\s+is\s+(\w+)",
-        r"tell\s+me\s+about\s+(\w+)",
+        r"(?:who|what)\s+is\s+(\w+(?:\s+[A-Z]\w+)*)",
+        r"tell\s+me\s+about\s+(\w+(?:\s+[A-Z]\w+)*)",
     ]
 
     def __init__(self, graph: GraphStore, inference: InferenceEngine, user_name: str):
         self.graph = graph
         self.inference = inference
         self.user_name = user_name
+        self._inference_dirty = True  # Run inference on first query
+
+    def mark_dirty(self):
+        """Mark inference cache as stale. Call after adding entities/relations."""
+        self._inference_dirty = True
 
     def try_answer(self, question: str) -> dict:
         """
@@ -63,8 +68,10 @@ class GraphQuery:
         """
         q = question.lower().strip()
 
-        # Ensure inferred relations are up to date
-        self.inference.run_full_inference()
+        # Ensure inferred relations are up to date (only when graph changed)
+        if self._inference_dirty:
+            self.inference.run_full_inference()
+            self._inference_dirty = False
 
         # 1. Relationship queries: "who is X to Y"
         for pattern in self.RELATIONSHIP_PATTERNS:

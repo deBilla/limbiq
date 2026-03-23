@@ -3,10 +3,10 @@
 Entry point: python -m limbiq.playground [OPTIONS]
 
 Starts FastAPI server with:
-  - Limbiq instance
-  - OpenTelemetry traces + metrics
-  - React dashboard at /
+  - Limbiq instance (signals + graph)
+  - Dashboard at /
   - REST API at /api/v1/
+  - API docs at /docs
 """
 
 import sys
@@ -27,17 +27,8 @@ def main():
     parser.add_argument("--embedding-model", default="all-MiniLM-L6-v2", help="Embedding model")
     parser.add_argument("--llm-url", default=None, help="LLM API base URL (e.g. http://localhost:11434/v1 for Ollama)")
     parser.add_argument("--llm-model", default="llama3.1", help="LLM model name")
-    parser.add_argument("--llm-api-key", default=None, help="LLM API key (for OpenAI, Claude, etc.)")
-    parser.add_argument(
-        "--llm-models", default=None,
-        help="Comma-separated name:model_id pairs, e.g. 'default:llama3.1,reasoning:deepseek-r1'. "
-             "All share the same --llm-url.",
-    )
-    parser.add_argument("--search-url", default=None, help="Search API URL (e.g. http://localhost:8888 for SearXNG)")
-    parser.add_argument("--search-provider", default="searxng", help="Search provider: searxng, brave, tavily, google_cse")
-    parser.add_argument("--search-api-key", default=None, help="Search API key (for Brave, Tavily, Google CSE)")
+    parser.add_argument("--llm-api-key", default=None, help="LLM API key")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    parser.add_argument("--no-otel", action="store_true", help="Disable OpenTelemetry")
 
     args = parser.parse_args()
 
@@ -46,85 +37,50 @@ def main():
         format="%(asctime)s  %(name)-30s  %(levelname)-7s  %(message)s",
     )
 
-    # Setup OpenTelemetry before anything else
-    if not args.no_otel:
-        from limbiq.playground.instrumentation import setup_telemetry
-        setup_telemetry(service_name="limbiq-playground")
-        logger.info("OpenTelemetry initialized (traces + metrics)")
-
-    # Create and run the app
     from limbiq.playground.server import create_app
     import uvicorn
 
     # Setup LLM if configured
     llm_client = None
-    model_router = None
     if args.llm_url:
-        from limbiq.llm import LLMClient
-        from limbiq.model_router import ModelRouter
-
-        # Build model map from --llm-models if provided
-        if args.llm_models:
-            model_map = {}
-            for pair in args.llm_models.split(","):
-                pair = pair.strip()
-                if ":" in pair:
-                    role, model_id = pair.split(":", 1)
-                    model_map[role.strip()] = LLMClient(
-                        base_url=args.llm_url,
-                        model=model_id.strip(),
-                        api_key=args.llm_api_key,
-                    )
-            if model_map:
-                model_router = ModelRouter(model_map, default=next(iter(model_map)))
-                logger.info(f"ModelRouter created: {list(model_map.keys())}")
-                # Use default model as llm_client for backwards compat
-                llm_client = model_router._get(model_router._default_key)
-
-        # Fall back to single --llm-model
-        if llm_client is None:
-            llm_client = LLMClient(
+        try:
+            from openai import OpenAI
+            client = OpenAI(
                 base_url=args.llm_url,
-                model=args.llm_model,
-                api_key=args.llm_api_key,
+                api_key=args.llm_api_key or "not-needed",
             )
+            model_name = args.llm_model
 
-        if llm_client.is_available():
-            logger.info(f"LLM connected: {args.llm_url} (model: {args.llm_model})")
-        else:
-            logger.warning(f"LLM not reachable at {args.llm_url} — falling back to heuristics")
-            llm_client = None
-            model_router = None
+            def llm_fn(prompt, **kwargs):
+                resp = client.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=kwargs.get("max_tokens", 512),
+                    temperature=kwargs.get("temperature", 0.7),
+                )
+                return resp.choices[0].message.content
 
-    # Setup search if configured
-    search_client = None
-    if args.search_url:
-        from limbiq.search import SearchClient
-        search_client = SearchClient(
-            base_url=args.search_url,
-            provider=args.search_provider,
-            api_key=args.search_api_key,
-        )
-        if search_client.is_available():
-            logger.info(f"Search connected: {args.search_url} ({args.search_provider})")
-        else:
-            logger.warning(f"Search not reachable at {args.search_url} — search disabled")
-            search_client = None
+            # Quick availability check
+            try:
+                llm_fn("Say OK")
+                llm_client = llm_fn
+                logger.info(f"LLM connected: {args.llm_url} (model: {args.llm_model})")
+            except Exception as e:
+                logger.warning(f"LLM not reachable at {args.llm_url}: {e}")
+        except ImportError:
+            logger.warning("openai package not installed — LLM disabled. pip install openai")
 
     app = create_app(
         store_path=args.store_path,
         user_id=args.user_id,
         embedding_model=args.embedding_model,
         llm_client=llm_client,
-        search_client=search_client,
-        model_router=model_router,
     )
 
     logger.info(f"Limbiq Playground starting on http://{args.host}:{args.port}")
     logger.info(f"  Store: {args.store_path}")
     logger.info(f"  User: {args.user_id}")
-    logger.info(f"  LLM: {llm_client or 'none (heuristic mode)'}")
-    logger.info(f"  Search: {search_client or 'none'}")
+    logger.info(f"  LLM: {llm_client and 'connected' or 'none (heuristic mode)'}")
     logger.info(f"  Dashboard: http://localhost:{args.port}")
     logger.info(f"  API docs: http://localhost:{args.port}/docs")
 

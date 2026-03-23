@@ -92,12 +92,21 @@ class AcetylcholineSignal(BaseSignal):
         # Check for explicit depth request
         is_depth_request = any(p in message.lower() for p in DEPTH_PATTERNS)
 
-        # Check topic continuity (3+ turns on same topic)
+        # Check topic continuity (3+ turns on same/similar topic)
         recent_non_none = [t for t in self._recent_topics[-TOPIC_CONTINUITY_THRESHOLD:] if t]
-        is_sustained = (
-            len(recent_non_none) >= TOPIC_CONTINUITY_THRESHOLD
-            and len(set(recent_non_none)) == 1
-        )
+        is_sustained = False
+        if len(recent_non_none) >= TOPIC_CONTINUITY_THRESHOLD:
+            # Check if topics are semantically similar (not just exact match)
+            if len(set(recent_non_none)) == 1:
+                is_sustained = True
+            else:
+                # Check if all topics share common words (semantic approximation)
+                topic_words = [set(t.split()) for t in recent_non_none]
+                common = topic_words[0]
+                for tw in topic_words[1:]:
+                    common = common & tw
+                if common:  # At least one word in common across all recent topics
+                    is_sustained = True
 
         if is_sustained or is_depth_request:
             # Find or create cluster
@@ -175,11 +184,14 @@ class AcetylcholineSignal(BaseSignal):
         return None, None
 
     def _detect_topic(self, message: str, history: list[dict] = None, llm_fn=None) -> str | None:
+        # Always try heuristic first — it's <1ms vs 500-2000ms for LLM.
+        # Only fall back to LLM if heuristic finds nothing and LLM is available.
+        result = self._detect_topic_heuristic(message)
+        if result:
+            return result
         if llm_fn:
-            result = self._detect_topic_llm(message, history, llm_fn)
-            if result:
-                return result
-        return self._detect_topic_heuristic(message)
+            return self._detect_topic_llm(message, history, llm_fn)
+        return None
 
     def _detect_topic_llm(self, message: str, history: list[dict], llm_fn) -> str | None:
         try:
@@ -205,7 +217,7 @@ class AcetylcholineSignal(BaseSignal):
             return None
 
     def _detect_topic_heuristic(self, message: str) -> str | None:
-        """Extract the dominant topic from a message using word frequency."""
+        """Extract the dominant topic using bigrams and word frequency."""
         words = message.lower().split()
         significant = [w.strip(".,!?;:'\"()[]{}") for w in words if len(w) > 2]
         significant = [w for w in significant if w and w not in _STOPWORDS]
@@ -213,8 +225,20 @@ class AcetylcholineSignal(BaseSignal):
         if not significant:
             return None
 
+        # Try bigrams first (more meaningful topics)
+        bigrams = []
+        for i in range(len(significant) - 1):
+            bigram = f"{significant[i]} {significant[i+1]}"
+            bigrams.append(bigram)
+
+        if bigrams:
+            bigram_counts = Counter(bigrams)
+            top_bigram = bigram_counts.most_common(1)
+            if top_bigram and top_bigram[0][1] >= 1:
+                return top_bigram[0][0]
+
+        # Fallback to most common single word
         counts = Counter(significant)
-        # Return the most common significant word
         most_common = counts.most_common(1)
         if most_common and most_common[0][1] >= 1:
             return most_common[0][0]

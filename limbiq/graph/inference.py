@@ -44,11 +44,40 @@ INFERENCE_RULES = {
     ("sister", "wife"): "sister_in_law_of",
 }
 
+# Reverse in-law rules: given user→wife→X and user→father_in_law→Y,
+# infer X→father→Y (wife's father = father-in-law).
+# Format: (user_rel_to_spouse, user_rel_to_inlaw) → (spouse, inlaw_pred, inlaw)
+REVERSE_INLAW_RULES = {
+    ("wife", "father_in_law"): "father",       # wife's father = father-in-law
+    ("wife", "mother_in_law"): "mother",        # wife's mother = mother-in-law
+    ("husband", "father_in_law"): "father",     # husband's father = father-in-law
+    ("husband", "mother_in_law"): "mother",     # husband's mother = mother-in-law
+    ("wife", "brother_in_law"): "brother",      # wife's brother = brother-in-law
+    ("wife", "sister_in_law"): "sister",        # wife's sister = sister-in-law
+    ("husband", "brother_in_law"): "brother",
+    ("husband", "sister_in_law"): "sister",
+}
+
 # Co-parent pairs: if user has both of these relations, the targets are spouses
 # e.g., Dimuthu→father→Upananda + Dimuthu→mother→Renuka → Upananda married_to Renuka
 CO_PARENT_PAIRS = [
     ("father", "mother"),  # user's parents are married
 ]
+
+# Multi-hop rules: traverse across entities
+# A→pred1→B, B→pred2→C ⟹ C is inferred_pred of A
+MULTI_HOP_RULES = {
+    # Grandparent relationships (both parents + both genders)
+    ("father", "father"): "grandfather_of",
+    ("father", "mother"): "grandmother_of",
+    ("mother", "father"): "grandfather_of",
+    ("mother", "mother"): "grandmother_of",
+    # Uncle/aunt relationships (parent + sibling)
+    ("father", "brother"): "uncle_of",
+    ("father", "sister"): "aunt_of",
+    ("mother", "brother"): "uncle_of",
+    ("mother", "sister"): "aunt_of",
+}
 
 # Human-readable descriptions for context injection
 RELATION_DESCRIPTIONS = {
@@ -93,7 +122,27 @@ class InferenceEngine:
         """
         self.graph.remove_inferred()
 
+        # Clean junk entities BEFORE inference to prevent combinatorial explosion
+        self.graph._cleanup_junk_entities()
+
         all_relations = self.graph.get_all_relations(include_inferred=False)
+
+        # Build set of valid entity IDs (skip junk entities)
+        valid_entity_ids = set()
+        for e in self.graph.get_all_entities():
+            if not self.graph._is_junk_name(e.name):
+                valid_entity_ids.add(e.id)
+
+        # Filter relations to only those between valid entities AND
+        # high confidence (>= 0.8) explicit relations. Low-confidence relations
+        # from noisy extraction should not seed inference chains.
+        all_relations = [
+            r for r in all_relations
+            if r.subject_id in valid_entity_ids
+            and r.object_id in valid_entity_ids
+            and r.confidence >= 0.8
+        ]
+
         inferred_count = 0
 
         # 1. In-law inference: for pairs of relations sharing the same subject,
@@ -162,6 +211,106 @@ class InferenceEngine:
                                 is_inferred=True,
                             ))
                             inferred_count += 1
+
+        # 3. Reverse in-law inference: given user→wife→Prabhashi and
+        #    user→father_in_law→Chandrasiri, infer Prabhashi→father→Chandrasiri.
+        #    This connects the graph through intermediate family relationships.
+        by_subject = {}
+        for r in all_relations:
+            by_subject.setdefault(r.subject_id, []).append(r)
+
+        for subject_id, rels in by_subject.items():
+            for rel_spouse in rels:
+                for rel_inlaw in rels:
+                    if rel_spouse.id == rel_inlaw.id:
+                        continue
+                    key = (rel_spouse.predicate, rel_inlaw.predicate)
+                    direct_pred = REVERSE_INLAW_RULES.get(key)
+                    if not direct_pred:
+                        continue
+                    # spouse→direct_pred→inlaw (e.g., Prabhashi→father→Chandrasiri)
+                    if rel_spouse.object_id == rel_inlaw.object_id:
+                        continue
+                    existing = self.graph.db.execute(
+                        "SELECT id FROM relations WHERE subject_id=? AND predicate=? AND object_id=?",
+                        (rel_spouse.object_id, direct_pred, rel_inlaw.object_id)
+                    ).fetchone()
+                    if not existing:
+                        self.graph.add_relation(Relation(
+                            subject_id=rel_spouse.object_id,
+                            predicate=direct_pred,
+                            object_id=rel_inlaw.object_id,
+                            confidence=min(rel_spouse.confidence, rel_inlaw.confidence) * 0.85,
+                            is_inferred=True,
+                        ))
+                        inferred_count += 1
+
+        # 4. Multi-hop inference: traverse across entities
+        #    A→pred1→B, B→pred2→C ⟹ infer C is inferred_pred of A
+        inferred_count += self._multi_hop_inference(all_relations)
+
+        return inferred_count
+
+    def _multi_hop_inference(self, all_relations: list) -> int:
+        """
+        Multi-hop inference: traverse across entities.
+        A→pred1→B, B→pred2→C ⟹ infer C is inferred_pred of A
+
+        GUARD: Only uses high-confidence explicit relations for hops.
+        Low-confidence relations (< 0.8) are often extraction noise
+        and should not be used to build inference chains.
+
+        Returns the number of new relations inferred.
+        """
+        # Only use high-confidence explicit (non-inferred) relations for hops
+        # This prevents chains built on noisy extraction results
+        hop_relations = [
+            r for r in all_relations
+            if r.confidence >= 0.8 and not r.is_inferred
+        ]
+
+        # Build adjacency from high-confidence relations only
+        outgoing = {}
+        for r in hop_relations:
+            outgoing.setdefault(r.subject_id, []).append(
+                (r.predicate, r.object_id, r.confidence)
+            )
+
+        inferred_count = 0
+        max_inferred = 20  # Safety cap
+
+        for entity_a, first_hops in outgoing.items():
+            for pred1, entity_b, conf1 in first_hops:
+                if entity_b not in outgoing:
+                    continue
+                for pred2, entity_c, conf2 in outgoing[entity_b]:
+                    if entity_c == entity_a:
+                        continue
+
+                    key = (pred1, pred2)
+                    inferred_pred = MULTI_HOP_RULES.get(key)
+                    if not inferred_pred:
+                        continue
+
+                    existing = self.graph.db.execute(
+                        "SELECT id FROM relations WHERE subject_id=? AND predicate=? AND object_id=?",
+                        (entity_c, inferred_pred, entity_a)
+                    ).fetchone()
+                    if existing:
+                        continue
+
+                    new_rel = Relation(
+                        subject_id=entity_c,
+                        predicate=inferred_pred,
+                        object_id=entity_a,
+                        confidence=min(conf1, conf2) * 0.8,
+                        is_inferred=True,
+                    )
+                    self.graph.add_relation(new_rel)
+                    inferred_count += 1
+
+                    if inferred_count >= max_inferred:
+                        return inferred_count
 
         return inferred_count
 
@@ -311,3 +460,84 @@ class InferenceEngine:
             parts.append(". ".join(other))
 
         return ". ".join(parts) + "." if parts else ""
+
+    def get_relevant_graph_context(
+        self,
+        query: str,
+        embedding_engine=None,
+        top_k: int = 5,
+    ) -> str:
+        """
+        Given a user query, find the most relevant entities using embedding
+        similarity and return their relationships as structured context.
+
+        This is the MAIN injection point for graph knowledge into LLM context.
+        Unlike graph_query.try_answer() (regex-based, narrow), this works for
+        ANY query by finding semantically related entities.
+
+        Returns a compact string of graph triples, or "" if no relevant data.
+        """
+        entities = self.graph.get_all_entities()
+        if not entities or not embedding_engine:
+            return ""
+
+        # Score entities by embedding similarity to the query
+        query_emb = embedding_engine.embed(query)
+        scored = []
+        for e in entities:
+            if self.graph._is_junk_name(e.name):
+                continue
+            e_emb = embedding_engine.embed(e.name)
+            sim = embedding_engine.similarity(query_emb, e_emb)
+            scored.append((e, sim))
+
+        # Also check if entity name appears directly in query (strong signal)
+        query_lower = query.lower()
+        for i, (e, sim) in enumerate(scored):
+            if e.name.lower() in query_lower:
+                scored[i] = (e, max(sim, 0.95))  # Boost to top
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top_entities = [e for e, sim in scored[:top_k] if sim > 0.3]
+
+        if not top_entities:
+            return ""
+
+        # Gather all relations involving these entities
+        entity_map = {e.id: e.name for e in entities}
+        top_ids = {e.id for e in top_entities}
+
+        all_rels = self.graph.get_all_relations(include_inferred=True)
+        relevant_rels = [
+            r for r in all_rels
+            if r.subject_id in top_ids or r.object_id in top_ids
+        ]
+
+        if not relevant_rels:
+            return ""
+
+        # Deduplicate: keep highest-confidence version of each (subj, pred, obj)
+        seen = {}
+        for r in relevant_rels:
+            key = (r.subject_id, r.predicate, r.object_id)
+            if key not in seen or r.confidence > seen[key].confidence:
+                seen[key] = r
+
+        # Format as readable triples, sorted by confidence
+        triples = []
+        for r in sorted(seen.values(), key=lambda x: -x.confidence):
+            subj = entity_map.get(r.subject_id, "?")
+            obj = entity_map.get(r.object_id, "?")
+            template = RELATION_DESCRIPTIONS.get(r.predicate)
+            if template:
+                desc = template.format(subject=subj, object=obj)
+            else:
+                desc = f"{subj} {r.predicate.replace('_', ' ')} {obj}"
+            if r.is_inferred:
+                desc += f" (inferred, {r.confidence:.0%})"
+            triples.append(desc)
+
+        if not triples:
+            return ""
+
+        return "; ".join(triples[:10]) + "."

@@ -219,17 +219,89 @@ lq.get_full_profile()       # Complete user profile across all signals
 lq.export_state()           # Full JSON export for debugging
 ```
 
+## Intent Classification & Smart Routing (v0.5)
+
+Limbiq can classify user intent and route queries intelligently — skipping the LLM entirely when the knowledge graph already has the answer.
+
+```python
+from limbiq import IntentClassifier, QueryRouter
+
+classifier = IntentClassifier()
+intent = classifier.classify("What's my wife's name?")
+# Intent(type='personal', confidence=0.9, is_question=True)
+
+router = QueryRouter()
+decision = router.route(intent, graph_result, world_summary="...")
+# If graph can answer → skip_llm=True, response from graph
+```
+
+### LLM Router (Swarm Architecture)
+
+Route different task types to different LLM agents based on capabilities and confidence:
+
+```python
+from limbiq import LLMRouter, TaskType, AgentCapability
+
+router = LLMRouter()
+router.register_agent("llama3", my_llama_fn, AgentCapability(
+    task_types=[TaskType.CHAT, TaskType.CREATIVE],
+    max_context_tokens=8192,
+))
+router.register_agent("gpt4o", my_gpt_fn, AgentCapability(
+    task_types=[TaskType.ANALYSIS, TaskType.CODE],
+    supports_tools=True,
+))
+
+lq = Limbiq(store_path="./data", user_id="dimuthu", llm_fn=router)
+```
+
+## Hallucination Detection (v0.4.3+)
+
+Pre- and post-generation fact checking against the knowledge graph and stored memories:
+
+```python
+detector = lq.get_hallucination_detector()
+
+# Before LLM generation — check what the graph knows
+grounding = detector.pre_generate(query, graph_result)
+
+# After LLM generation — verify claims against memory
+verification = detector.post_generate(response, user_name, query)
+
+if detector.should_regenerate(verification):
+    correction = detector.correction_prompt(verification, query)
+```
+
+## NLI Contradiction Detection (v0.5)
+
+Semantic contradiction detection using a cross-encoder model:
+
+```python
+from limbiq import NLIChecker
+
+nli = NLIChecker()
+result = nli.check("User's wife is Prabhashi", "Your wife is Sarah")
+# {"label": "contradiction", "score": 0.95}
+```
+
 ## How It Works
 
 - **LLM-agnostic** — works with any LLM via a unified OpenAI-compatible client (Ollama, OpenAI, Claude, vLLM, LM Studio)
 - **Zero weight modification** — all adaptation through context manipulation and activation steering
 - **Knowledge graph** — entities and relations extracted automatically, inferred transitively
+- **Smart routing** — intent classification + query routing skips LLM when graph suffices
+- **Hallucination detection** — pre/post-generation fact checking with NLI contradiction detection
+- **Swarm architecture** — route tasks to the best agent based on capabilities and confidence
 - **Interactive playground** — web dashboard with chat, graph visualization, and trace viewer
 - **SQLite persistence** — memories, graph, and rules survive across sessions
 - **Semantic search** — sentence-transformers for embedding-based retrieval (TF-IDF fallback)
 - **Transparent** — every signal is logged with trigger, timestamp, and effect
 - **Reversible** — suppressed memories can be restored, rules deactivated, nothing permanently destructive
-- **Thread-safe** — per-thread SQLite connections for Gradio, FastAPI, etc.
+- **Thread-safe** — per-thread SQLite connections with thread-safe embedding cache
+
+## Architecture
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full system topology, data flow diagrams, dependency graph, and module reference.
 
 ## License
 

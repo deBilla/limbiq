@@ -46,17 +46,46 @@ class ClusterStore:
         return self._row_to_cluster(row)
 
     def find_matching_cluster(self, topic: str) -> KnowledgeCluster | None:
-        """Find a cluster whose topic is contained in or contains the given topic."""
+        """Find a cluster whose topic overlaps with the given topic.
+
+        Matching strategy (in order):
+        1. Substring containment (exact)
+        2. Significant word overlap — if the topic words (excluding
+           very short tokens) share >= 50% with a cluster topic,
+           they are considered a match.  This handles bigram topics
+           like "rust ownership" vs "rust borrowing" that share a
+           domain word.
+        """
         db = self._store.db
         cursor = db.execute(
             "SELECT id, topic, description, created_at, last_accessed, access_count, memory_ids "
             "FROM knowledge_clusters"
         )
         topic_lower = topic.lower()
+        topic_words = {w for w in topic_lower.split() if len(w) > 2}
+
+        best_match = None
+        best_overlap = 0.0
+
         for row in cursor.fetchall():
             cluster_topic = row[1].lower()
+
+            # Strategy 1: substring containment (strong match)
             if cluster_topic in topic_lower or topic_lower in cluster_topic:
                 return self._row_to_cluster(row)
+
+            # Strategy 2: word overlap ratio
+            if topic_words:
+                cluster_words = {w for w in cluster_topic.split() if len(w) > 2}
+                if cluster_words:
+                    common = topic_words & cluster_words
+                    overlap = len(common) / min(len(topic_words), len(cluster_words))
+                    if overlap >= 0.5 and len(common) >= 1 and overlap > best_overlap:
+                        best_match = row
+                        best_overlap = overlap
+
+        if best_match:
+            return self._row_to_cluster(best_match)
         return None
 
     def create_cluster(self, topic: str, description: str = "") -> KnowledgeCluster:

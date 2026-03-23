@@ -167,8 +167,10 @@ class GraphAttentionLayer(nn.Module):
         self.leaky_relu = nn.LeakyReLU(0.2)
 
         nn.init.xavier_uniform_(self.W.weight)
-        nn.init.xavier_uniform_(self.a_src.unsqueeze(0))
-        nn.init.xavier_uniform_(self.a_dst.unsqueeze(0))
+        nn.init.xavier_uniform_(self.a_src.data.unsqueeze_(0))
+        self.a_src.data.squeeze_(0)
+        nn.init.xavier_uniform_(self.a_dst.data.unsqueeze_(0))
+        self.a_dst.data.squeeze_(0)
 
     def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
         """
@@ -686,6 +688,7 @@ class GNNPropagation:
                         (feat.memory_id,)
                     )
                     self.store.db.commit()
+                    self.store._emb_dirty = True
                     priority_deflated += 1
 
         # 3. Merge duplicates using GNN merge embeddings

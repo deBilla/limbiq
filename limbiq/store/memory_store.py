@@ -11,6 +11,7 @@ import sqlite3
 import threading
 import uuid
 import time
+import numpy as np
 
 from limbiq.types import Memory, MemoryTier, SuppressionReason
 
@@ -39,6 +40,13 @@ class MemoryStore:
         os.makedirs(store_path, exist_ok=True)
         self._db_path = os.path.join(store_path, f"{user_id}.db")
         self._init_tables()
+
+        # Embedding cache for vectorized search
+        self._emb_matrix = None  # Cached numpy matrix of all embeddings
+        self._emb_ids = None     # Corresponding memory IDs
+        self._emb_dirty = True   # Invalidation flag
+        self._emb_include_suppressed = None  # Track last include_suppressed value
+        self._emb_lock = threading.Lock()    # Thread-safe cache rebuilds
 
     @property
     def db(self) -> sqlite3.Connection:
@@ -92,6 +100,15 @@ class MemoryStore:
                 turns INTEGER DEFAULT 0,
                 signals_fired INTEGER DEFAULT 0
             );
+
+            CREATE INDEX IF NOT EXISTS idx_memories_suppressed ON memories(is_suppressed);
+            CREATE INDEX IF NOT EXISTS idx_memories_priority ON memories(is_priority);
+            CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories(tier);
+            CREATE INDEX IF NOT EXISTS idx_memories_confidence ON memories(confidence);
+            CREATE INDEX IF NOT EXISTS idx_signal_log_type ON signal_log(signal_type);
+            CREATE INDEX IF NOT EXISTS idx_signal_log_timestamp ON signal_log(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id);
+            CREATE INDEX IF NOT EXISTS idx_conversations_compressed ON conversations(compressed);
             """
         )
         self.db.commit()
@@ -129,6 +146,13 @@ class MemoryStore:
         )
         self.db.commit()
 
+        # Incremental cache update: append to existing cache instead of
+        # triggering a full rebuild (which blocks 50-200ms for 1000 memories)
+        if embedding is not None:
+            self._append_to_cache(memory_id, embedding)
+        else:
+            self._emb_dirty = True
+
         return Memory(
             id=memory_id,
             content=content,
@@ -140,41 +164,79 @@ class MemoryStore:
             metadata=metadata or {},
         )
 
+    def _append_to_cache(self, memory_id: str, embedding: list[float]) -> None:
+        """Incrementally append a single embedding to the cache without full rebuild."""
+        with self._emb_lock:
+            # Only append if cache is initialized and not dirty
+            # (if dirty, next search will do a full rebuild anyway)
+            if self._emb_dirty or self._emb_matrix is None:
+                self._emb_dirty = True
+                return
+
+            # Skip if include_suppressed tracking would be wrong
+            # (new memories are never suppressed, so this is safe for both modes)
+            emb_array = np.array(embedding, dtype=np.float32)
+            norm = np.linalg.norm(emb_array)
+            if norm == 0:
+                return
+            emb_array = emb_array / norm
+
+            # Check dimension compatibility
+            if self._emb_matrix.shape[1] != emb_array.shape[0]:
+                self._emb_dirty = True
+                return
+
+            self._emb_matrix = np.vstack([self._emb_matrix, emb_array.reshape(1, -1)])
+            self._emb_ids = np.append(self._emb_ids, memory_id)
+
     def search(
         self,
         query_embedding: list[float],
         top_k: int = 10,
         include_suppressed: bool = False,
     ) -> list[Memory]:
-        """Search memories by embedding similarity."""
-        clause = "" if include_suppressed else "WHERE is_suppressed = 0"
-        cursor = self.db.execute(
-            f"SELECT id, content, tier, confidence, created_at, session_count, "
-            f"access_count, is_priority, is_suppressed, suppression_reason, "
-            f"source, metadata, embedding FROM memories {clause}"
-        )
+        """Search memories by embedding similarity using vectorized numpy computation."""
+        # Rebuild cache if dirty, uninitialized, or include_suppressed flag changed
+        if self._emb_dirty or self._emb_matrix is None or self._emb_include_suppressed != include_suppressed:
+            self._rebuild_embedding_cache(include_suppressed)
 
-        from limbiq.store.embeddings import EmbeddingEngine
+        # Return empty if no embeddings available
+        if self._emb_matrix is None or len(self._emb_matrix) == 0:
+            return []
 
-        scored = []
-        for row in cursor.fetchall():
-            emb = _deserialize_embedding(row[12])
-            if emb is None:
-                continue
-            # Inline cosine similarity for performance
-            dot = sum(a * b for a, b in zip(query_embedding, emb))
-            norm_a = sum(a * a for a in query_embedding) ** 0.5
-            norm_b = sum(b * b for b in emb) ** 0.5
-            if norm_a == 0 or norm_b == 0:
-                sim = 0.0
-            else:
-                sim = dot / (norm_a * norm_b)
+        # Normalize query embedding
+        query = np.array(query_embedding, dtype=np.float32)
+        query_norm = np.linalg.norm(query)
+        if query_norm == 0:
+            return []
+        query = query / query_norm
 
-            mem = self._row_to_memory(row)
-            scored.append((sim, mem))
+        # Handle dimension mismatch (e.g. model changed since embeddings were stored)
+        cache_dim = self._emb_matrix.shape[1]
+        query_dim = query.shape[0]
+        if cache_dim != query_dim:
+            # Invalidate cache and fall back to row-by-row search
+            self._emb_dirty = True
+            self._emb_matrix = None
+            self._emb_ids = None
+            return self._search_fallback(query_embedding, top_k, include_suppressed)
 
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [m for _, m in scored[:top_k]]
+        # Batch cosine similarity (matrix already normalized in cache)
+        sims = self._emb_matrix @ query
+
+        # Get top-k indices by similarity
+        top_indices = np.argsort(sims)[-top_k:][::-1]
+
+        results = []
+        for idx in top_indices:
+            if sims[idx] <= 0:
+                break
+            mem_id = self._emb_ids[idx]
+            mem = self._get_memory_by_id(mem_id)
+            if mem:
+                results.append(mem)
+
+        return results
 
     def get_priority_memories(self) -> list[Memory]:
         cursor = self.db.execute(
@@ -201,6 +263,7 @@ class MemoryStore:
             (reason_val, memory_id),
         )
         self.db.commit()
+        self._emb_dirty = True
 
     def restore(self, memory_id: str) -> None:
         self.db.execute(
@@ -209,6 +272,7 @@ class MemoryStore:
             (memory_id,),
         )
         self.db.commit()
+        self._emb_dirty = True
 
     def age_all(self) -> None:
         self.db.execute("UPDATE memories SET session_count = session_count + 1")
@@ -221,12 +285,24 @@ class MemoryStore:
         )
         self.db.commit()
 
+    def increment_access_batch(self, memory_ids: list[str]) -> None:
+        """Increment access count for multiple memories in a single transaction."""
+        if not memory_ids:
+            return
+        placeholders = ",".join("?" * len(memory_ids))
+        self.db.execute(
+            f"UPDATE memories SET access_count = access_count + 1 WHERE id IN ({placeholders})",
+            memory_ids,
+        )
+        self.db.commit()
+
     def boost_confidence(self, memory_id: str, new_confidence: float) -> None:
         self.db.execute(
             "UPDATE memories SET confidence = ? WHERE id = ?",
             (new_confidence, memory_id),
         )
         self.db.commit()
+        self._emb_dirty = True
 
     def get_stale(self, min_sessions: int = 10) -> list[Memory]:
         cursor = self.db.execute(
@@ -245,6 +321,7 @@ class MemoryStore:
             (min_sessions,),
         )
         self.db.commit()
+        self._emb_dirty = True
         return cursor.rowcount
 
     def store_conversation(self, messages: list[dict], session_id: str = None) -> None:
@@ -315,6 +392,91 @@ class MemoryStore:
             )
 
         return {"user_id": self.user_id, "memories": memories}
+
+    def _search_fallback(
+        self,
+        query_embedding: list[float],
+        top_k: int = 10,
+        include_suppressed: bool = False,
+    ) -> list[Memory]:
+        """Row-by-row cosine similarity search — used when dimensions mismatch."""
+        clause = "" if include_suppressed else "WHERE is_suppressed = 0"
+        cursor = self.db.execute(
+            f"SELECT id, embedding FROM memories {clause}"
+        )
+
+        query = np.array(query_embedding, dtype=np.float32)
+        query_norm = np.linalg.norm(query)
+        if query_norm == 0:
+            return []
+        query = query / query_norm
+        query_dim = query.shape[0]
+
+        scored = []
+        for row_id, emb_bytes in cursor.fetchall():
+            emb = _deserialize_embedding(emb_bytes)
+            if emb is None or len(emb) != query_dim:
+                continue
+            emb_arr = np.array(emb, dtype=np.float32)
+            norm = np.linalg.norm(emb_arr)
+            if norm == 0:
+                continue
+            sim = float(np.dot(emb_arr / norm, query))
+            if sim > 0:
+                scored.append((row_id, sim))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        results = []
+        for mem_id, _ in scored[:top_k]:
+            mem = self._get_memory_by_id(mem_id)
+            if mem:
+                results.append(mem)
+        return results
+
+    def _rebuild_embedding_cache(self, include_suppressed: bool = False) -> None:
+        """Rebuild the normalized embedding matrix cache."""
+        with self._emb_lock:
+            clause = "" if include_suppressed else "WHERE is_suppressed = 0"
+            cursor = self.db.execute(
+                f"SELECT id, embedding FROM memories {clause}"
+            )
+
+            embeddings = []
+            memory_ids = []
+
+            for row_id, emb_bytes in cursor.fetchall():
+                emb = _deserialize_embedding(emb_bytes)
+                if emb is None:
+                    continue
+
+                # Normalize embedding
+                emb_array = np.array(emb, dtype=np.float32)
+                norm = np.linalg.norm(emb_array)
+                if norm > 0:
+                    emb_array = emb_array / norm
+                    embeddings.append(emb_array)
+                    memory_ids.append(row_id)
+
+            if embeddings:
+                self._emb_matrix = np.array(embeddings, dtype=np.float32)
+                self._emb_ids = np.array(memory_ids)
+            else:
+                self._emb_matrix = None
+                self._emb_ids = None
+
+            self._emb_dirty = False
+            self._emb_include_suppressed = include_suppressed
+
+    def _get_memory_by_id(self, memory_id: str) -> Memory | None:
+        """Retrieve a single memory by ID."""
+        cursor = self.db.execute(
+            "SELECT id, content, tier, confidence, created_at, session_count, "
+            "access_count, is_priority, is_suppressed, suppression_reason, "
+            "source, metadata, embedding FROM memories WHERE id = ?",
+            (memory_id,),
+        )
+        row = cursor.fetchone()
+        return self._row_to_memory(row) if row else None
 
     def _row_to_memory(self, row) -> Memory:
         return Memory(

@@ -8,10 +8,13 @@ Thread-safe: uses the MemoryStore's per-thread connection via store.db property.
 """
 
 import json
+import logging
 import uuid
 import time
 from dataclasses import dataclass, field
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -53,6 +56,15 @@ class GraphStore:
         self._store = memory_store
         self._init_tables()
 
+    def heal(self):
+        """Public self-healing entry point. Safe to call repeatedly.
+
+        Detects junk entities (predicate words stored as entity names),
+        resolves them from the graph or memories, re-points relations,
+        and deletes the junk. Called after every observe() and at startup.
+        """
+        self._cleanup_junk_entities()
+
     @property
     def db(self):
         return self._store.db
@@ -90,54 +102,279 @@ class GraphStore:
         self._cleanup_junk_entities()
 
     def _cleanup_junk_entities(self):
-        """Remove junk entities and their relations on startup."""
+        """Self-healing: detect, resolve, and fix junk entities on every startup.
+
+        For each entity whose name is a known predicate/relationship word
+        (e.g., "Wife", "Dog", "Boss"):
+        1. Try to resolve via graph (another relation to the real entity)
+        2. If graph can't resolve, mine priority MEMORIES for the real name
+        3. Re-point relations from junk → real entity (preserving graph data)
+        4. Delete the junk entity
+
+        This means past extraction mistakes are automatically repaired
+        every time the store is opened — even if the only data source
+        is in the memory store, not the graph.
+        """
         try:
+            from limbiq.graph.entities import VALID_PREDICATES, RELATION_ALIASES
+
             entities = self.db.execute("SELECT id, name FROM entities").fetchall()
-            junk_ids = [eid for eid, name in entities if self._is_junk_name(name)]
-            if junk_ids:
-                placeholders = ",".join("?" * len(junk_ids))
-                self.db.execute(f"DELETE FROM relations WHERE subject_id IN ({placeholders})", junk_ids)
-                self.db.execute(f"DELETE FROM relations WHERE object_id IN ({placeholders})", junk_ids)
-                self.db.execute(f"DELETE FROM entities WHERE id IN ({placeholders})", junk_ids)
+            healed = 0
+            deleted = 0
+
+            for eid, name in entities:
+                # Check static junk first (fast path)
+                if self._is_junk_name(name):
+                    self._delete_entity_and_relations(eid)
+                    deleted += 1
+                    continue
+
+                # Check if name is a predicate/relationship word
+                normalized = name.lower().strip().replace("-", "_").replace(" ", "_")
+                alias_resolved = RELATION_ALIASES.get(normalized, normalized)
+                if alias_resolved not in VALID_PREDICATES:
+                    continue
+
+                # Protect pet entities: if "Dog"/"Cat" is typed as "animal"
+                # and has a "pet" relation from the user, it's a real entity
+                pet_preds = {"dog", "cat", "pet"}
+                if alias_resolved in pet_preds:
+                    etype_row = self.db.execute(
+                        "SELECT entity_type FROM entities WHERE id=?", (eid,)
+                    ).fetchone()
+                    if etype_row and etype_row[0] == "animal":
+                        continue  # Keep it — it's a real pet entity
+
+                # This entity name IS a relationship word (e.g., "Wife").
+                # Try to find the real entity it should point to.
+                real_entity_id = self._resolve_from_graph(eid, alias_resolved)
+
+                # If graph can't resolve, try mining memories
+                if not real_entity_id:
+                    real_entity_id = self._resolve_from_memories(eid, name, alias_resolved)
+
+                if real_entity_id:
+                    self._repoint_relations(eid, real_entity_id)
+                    healed += 1
+
+                # Delete the junk entity either way
+                self._delete_entity_and_relations(eid)
+                deleted += 1
+
+            if healed or deleted:
                 self.db.commit()
-        except Exception:
-            pass
+                logger.info(f"Graph self-heal: {healed} re-pointed, {deleted} junk entities removed")
+        except Exception as e:
+            logger.warning(f"Failed to cleanup junk entities: {e}")
+
+    def _get_user_entity_id(self) -> Optional[str]:
+        """Find the primary user entity (person with most outgoing explicit relations)."""
+        row = self.db.execute(
+            "SELECT e.id FROM entities e "
+            "JOIN relations r ON r.subject_id = e.id "
+            "WHERE e.entity_type = 'person' AND r.is_inferred = 0 "
+            "GROUP BY e.id ORDER BY COUNT(r.id) DESC LIMIT 1"
+        ).fetchone()
+        return row[0] if row else None
+
+    def _resolve_from_graph(self, junk_id: str, predicate: str) -> Optional[str]:
+        """Try to find the real entity via existing graph relations.
+
+        Looks for: UserEntity --predicate--> RealEntity (where RealEntity != junk).
+        """
+        user_id = self._get_user_entity_id()
+        if not user_id:
+            return None
+        row = self.db.execute(
+            "SELECT object_id FROM relations WHERE subject_id=? AND predicate=?",
+            (user_id, predicate),
+        ).fetchone()
+        if row and row[0] != junk_id:
+            return row[0]
+        return None
+
+    def _resolve_from_memories(self, junk_id: str, junk_name: str, predicate: str) -> Optional[str]:
+        """Mine priority memories for the real entity name.
+
+        Searches memories for patterns like:
+          "wife is Prabhashi", "wife's name is Prabhashi",
+          "Prabhashi is my wife", "married to Prabhashi"
+
+        If found, creates the entity in the graph and returns its ID.
+        """
+        import re
+
+        relationship = junk_name.lower()
+        # Search priority + mid-tier memories for relationship mentions
+        rows = self.db.execute(
+            "SELECT content FROM memories "
+            "WHERE is_suppressed = 0 AND (is_priority = 1 OR tier IN ('priority', 'mid')) "
+            "ORDER BY is_priority DESC, created_at DESC"
+        ).fetchall()
+
+        # Patterns that extract a proper name from relationship context
+        patterns = [
+            # "wife is Prabhashi" / "wife's name is Prabhashi"
+            re.compile(
+                rf"\b{re.escape(relationship)}(?:'s)?\s+(?:name\s+)?is\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",
+                re.I,
+            ),
+            # "Prabhashi is my/his/the wife"
+            re.compile(
+                rf"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+is\s+(?:my|his|her|the|user'?s?)\s+{re.escape(relationship)}",
+                re.I,
+            ),
+            # "married to Prabhashi" (for wife/husband)
+            re.compile(
+                r"married\s+to\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",
+                re.I,
+            ) if relationship in ("wife", "husband", "partner") else None,
+            # "my wife Prabhashi" / "his dog Max"
+            re.compile(
+                rf"(?:my|his|her|user'?s?)\s+{re.escape(relationship)}\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",
+                re.I,
+            ),
+        ]
+        patterns = [p for p in patterns if p is not None]
+
+        for (content,) in rows:
+            for pattern in patterns:
+                match = pattern.search(content)
+                if match:
+                    real_name = match.group(1).strip()
+                    # Validate: the extracted name shouldn't itself be a junk name
+                    if self._is_junk_name(real_name) or len(real_name) < 2:
+                        continue
+
+                    logger.info(f"Graph self-heal: resolved '{junk_name}' → '{real_name}' from memory")
+
+                    # Find or create the real entity
+                    existing = self.find_entity_by_name(real_name)
+                    if existing:
+                        return existing.id
+
+                    # Create the entity
+                    entity = self.add_entity(Entity(
+                        name=real_name, entity_type="person",
+                    ))
+                    if entity:
+                        # Also create the correct relation: user --predicate--> real_entity
+                        user_id = self._get_user_entity_id()
+                        if user_id:
+                            self.add_relation(Relation(
+                                subject_id=user_id, predicate=predicate,
+                                object_id=entity.id,
+                            ))
+                        return entity.id
+        return None
+
+    def _repoint_relations(self, old_id: str, new_id: str):
+        """Re-point all relations from old entity to new entity."""
+        self.db.execute(
+            "UPDATE relations SET subject_id=? WHERE subject_id=?",
+            (new_id, old_id),
+        )
+        self.db.execute(
+            "UPDATE relations SET object_id=? WHERE object_id=?",
+            (new_id, old_id),
+        )
+
+    def _delete_entity_and_relations(self, eid: str):
+        """Delete an entity and all its relations."""
+        self.db.execute("DELETE FROM relations WHERE subject_id=? OR object_id=?", (eid, eid))
+        self.db.execute("DELETE FROM entities WHERE id=?", (eid,))
+        self.db.execute("DELETE FROM entities WHERE id=?", (eid,))
 
     # ── Entity operations ─────────────────────────────────────
 
-    # Entity names that should never be stored — typically LLM extraction artifacts
-    _JUNK_NAMES = {"none", "null", "n/a", "unknown", "undefined", "default", "",
-                   "?", "topic", "user", "the user", "assistant", "ai",
-                   "wife", "husband", "father", "mother", "brother", "sister",
-                   "son", "daughter", "dog", "cat", "pet", "boss", "friend",
-                   "feeding schedule care", "well-being", "feeding schedule"}
+    # Entity names that should never be stored — typically LLM extraction artifacts.
+    # NOTE: "user" is NOT in this list — EntityExtractor maps "user" → real
+    # user_name (e.g. "Dimuthu") at extraction time (entities.py:448-449).
+    # Blocking "user" here silently kills ALL user-centric relations.
+    _JUNK_NAMES = {
+        "none", "null", "n/a", "unknown", "undefined", "default", "",
+        "?", "topic", "the user", "assistant", "ai", "bot",
+        "feeding schedule care", "well-being", "feeding schedule",
+        # Pronouns and common words that slip through as entities
+        "he", "she", "it", "they", "we", "you", "i", "me", "him", "her",
+        "my", "his", "our", "your", "their", "us", "them",
+        "if", "but", "and", "or", "so", "yet", "nor",
+        "based", "however", "therefore", "also", "just", "really",
+        "actually", "yes", "no", "ok", "sure", "well",
+        "today", "tomorrow", "yesterday", "now", "then", "here", "there",
+        "everything", "something", "nothing", "anything",
+        "everyone", "someone", "anyone",
+    }
 
     # Reject entities with names shorter than 2 chars or that look like numbers/dates
     @staticmethod
     def _is_junk_name(name: str) -> bool:
+        import re
         stripped = name.strip()
+        # Strip possessives
+        if stripped.endswith(("\u2019s", "'s")):
+            stripped = stripped[:-2].strip()
+        # Strip parenthetical content: "User (Dimuthu)" → "User"
+        stripped = re.sub(r'\s*\([^)]*\)\s*$', '', stripped).strip()
         if stripped.lower() in GraphStore._JUNK_NAMES:
             return True
         if len(stripped) < 2:
             return True
         # Reject pure numbers, dates, time expressions
-        import re
         if re.match(r'^[\d\s.,:/-]+$', stripped):
             return True
         if re.match(r'^\d+\s+(days?|weeks?|months?|years?|hours?|minutes?)\s+ago$', stripped, re.I):
             return True
+        # Reject multi-word names starting with sentence particles
+        words = stripped.split()
+        if len(words) >= 2:
+            _STARTERS = {"if", "no", "yes", "ok", "so", "and", "but", "or", "thank",
+                         "thanks", "please", "hi", "hello", "hey", "not", "nor", "yet"}
+            if words[0].lower() in _STARTERS:
+                return True
         return False
 
+    @staticmethod
+    def _name_similarity(a: str, b: str) -> float:
+        """Simple character-level similarity for fuzzy entity matching.
+        Uses Levenshtein-like ratio: 1.0 = identical, 0.0 = no overlap."""
+        a, b = a.lower().strip(), b.lower().strip()
+        if a == b:
+            return 1.0
+        if not a or not b:
+            return 0.0
+        # Character bigram overlap (Dice coefficient)
+        def bigrams(s):
+            return set(s[i:i+2] for i in range(len(s)-1)) if len(s) > 1 else {s}
+        ba, bb = bigrams(a), bigrams(b)
+        if not ba or not bb:
+            return 0.0
+        return 2.0 * len(ba & bb) / (len(ba) + len(bb))
+
     def add_entity(self, entity: Entity) -> Optional[Entity]:
-        """Add entity. If name already exists (case-insensitive), return existing.
-        Returns None if entity name is rejected as junk."""
+        """Add entity. If name already exists (case-insensitive or fuzzy match),
+        return existing. Returns None if entity name is rejected as junk."""
         # Reject junk names from LLM extraction
         if self._is_junk_name(entity.name):
             return None
 
+        # Exact match first
         existing = self.find_entity_by_name(entity.name)
         if existing:
             return existing
+
+        # Fuzzy match: catch typos like "Prabhasi" ≈ "Prabhashi"
+        # Only for short names (< 20 chars) to avoid false positives
+        if len(entity.name) < 20:
+            all_entities = self.get_all_entities()
+            for e in all_entities:
+                sim = self._name_similarity(entity.name, e.name)
+                if sim >= 0.75 and e.entity_type == entity.entity_type:
+                    logger.info(
+                        f"Fuzzy entity match: '{entity.name}' ≈ '{e.name}' "
+                        f"(sim={sim:.2f}), merging"
+                    )
+                    return e
 
         self.db.execute(
             "INSERT INTO entities (id, name, entity_type, properties, source_memory_id, created_at) "

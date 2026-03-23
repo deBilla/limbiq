@@ -79,29 +79,47 @@ class ActivationRetrieval:
             f"embedding FROM memories {clause}"
         )
 
-        candidates = []
-        for row in cursor.fetchall():
+        # Collect all candidates and embeddings
+        rows = cursor.fetchall()
+        embs = []
+        valid_rows = []
+        for row in rows:
             emb = _deserialize_embedding(row[6])
-            if emb is None:
-                continue
+            if emb is not None:
+                embs.append(emb)
+                valid_rows.append(row)
 
-            # Cosine similarity
-            dot = sum(a * b for a, b in zip(query_embedding, emb))
-            norm_a = sum(a * a for a in query_embedding) ** 0.5
-            norm_b = sum(b * b for b in emb) ** 0.5
-            sim = dot / (norm_a * norm_b) if (norm_a > 0 and norm_b > 0) else 0.0
+        if not embs:
+            return []
 
+        # Batch cosine similarity using numpy
+        emb_matrix = np.array(embs, dtype=np.float32)
+        query_vec = np.array(query_embedding, dtype=np.float32)
+
+        # Normalize embeddings
+        emb_norms = np.linalg.norm(emb_matrix, axis=1, keepdims=True)
+        emb_norms = np.maximum(emb_norms, 1e-8)
+        emb_matrix = emb_matrix / emb_norms
+
+        # Normalize query
+        query_norm = np.linalg.norm(query_vec)
+        if query_norm == 0:
+            return []
+        query_vec = query_vec / query_norm
+
+        # Compute all similarities at once
+        sims = emb_matrix @ query_vec
+
+        candidates = []
+        for i, row in enumerate(valid_rows):
             candidates.append({
                 "id": row[0],
                 "content": row[1],
                 "tier": row[2],
                 "confidence": row[3],
                 "is_priority": bool(row[4]),
-                "embedding_sim": max(0, sim),
+                "embedding_sim": max(0.0, float(sims[i])),
             })
-
-        if not candidates:
-            return []
 
         # Step 2: Get GNN activations (query-biased)
         activation_map = {}
@@ -222,7 +240,8 @@ class GraphStateContextBuilder:
 
     def build_context(self, query: str, scored_memories: list[ScoredMemory],
                       world_summary: str = None, graph_answer: str = None,
-                      active_rules=None, caution_flag: str = None) -> str:
+                      active_rules=None, caution_flag: str = None,
+                      graph_context: str = None) -> str:
         """Build the full context string for LLM injection."""
         sections = []
 
@@ -236,6 +255,12 @@ class GraphStateContextBuilder:
         # Graph direct answer (most token-efficient)
         if graph_answer:
             sections.append(f"[KNOWN FACT] {graph_answer}")
+
+        # Graph relationship context (entities relevant to this query)
+        if graph_context:
+            sections.append(
+                f"[GRAPH KNOWLEDGE — relationships known about entities mentioned]\n{graph_context}"
+            )
 
         # World summary from graph
         if world_summary:

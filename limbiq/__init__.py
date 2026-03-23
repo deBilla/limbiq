@@ -1,6 +1,8 @@
 """
 Limbiq -- Neurotransmitter-inspired adaptive learning for LLMs.
 
+Stripped to essentials: signals + graph generation + self-healing.
+
 Usage:
     from limbiq import Limbiq
 
@@ -9,6 +11,8 @@ Usage:
     # ... send to LLM with result.context injected ...
     lq.observe("Hello, my name is Dimuthu", llm_response)
 """
+
+from collections.abc import Callable
 
 from limbiq.core import LimbiqCore
 from limbiq.types import (
@@ -23,32 +27,33 @@ from limbiq.types import (
     RetrievalConfig,
 )
 from limbiq.graph.propagation import ActiveGraphPropagation, PropagationResult
-from limbiq.graph.gnn import GNNPropagation
-from limbiq.graph.pattern_completion import PatternCompletion
-from limbiq.graph.reasoning import GraphReasoner, ReasoningResult
-from limbiq.llm import LLMClient
-from limbiq.search import SearchClient, SearchResult
-from limbiq.onboarding import OnboardingManager, AgentProfile
-from limbiq.tools import (
-    ToolRegistry, BaseTool, ToolResult,
-    FileReaderTool, TerminalTool, CalculatorTool, WebFetchTool,
-    format_tool_results,
-)
-from limbiq.model_router import ModelRouter
-from limbiq.hallucination import HallucinationDetector, GroundingAnalyzer, FactVerifier
-from limbiq.hallucination.grounding import GroundingReport, GroundingLevel
-from limbiq.hallucination.verifier import VerificationReport, ClaimStatus
+
+try:
+    from limbiq.graph.gnn import GNNPropagation
+except ImportError:
+    GNNPropagation = None
+
+try:
+    from limbiq.graph.pattern_completion import PatternCompletion
+except ImportError:
+    PatternCompletion = None
+
+try:
+    from limbiq.graph.reasoning import GraphReasoner, ReasoningResult
+except ImportError:
+    GraphReasoner = None
+    ReasoningResult = None
 
 
 class Limbiq:
-    """Main interface for Limbiq."""
+    """Main interface for Limbiq — signals + graph focused."""
 
     def __init__(
         self,
         store_path: str = "./neuro_data",
         user_id: str = "default",
         embedding_model: str = "all-MiniLM-L6-v2",
-        llm_fn=None,
+        llm_fn: Callable | None = None,
     ):
         self._core = LimbiqCore(store_path, user_id, embedding_model, llm_fn)
 
@@ -64,17 +69,17 @@ class Limbiq:
         """Observe a completed exchange and fire appropriate signals."""
         return self._core.observe(message, response, feedback)
 
-    def start_session(self):
+    def start_session(self) -> None:
         """Start a new conversation session."""
         self._core.start_session()
 
     def end_session(self) -> dict:
-        """End session and run compression/cleanup."""
+        """End session and run cleanup."""
         return self._core.end_session()
 
     # -- Explicit signals (Dopamine / GABA) --
 
-    def dopamine(self, content: str):
+    def dopamine(self, content: str) -> None:
         """Manually tag a piece of information as high-priority."""
         embedding = self._core.embeddings.embed(content)
         self._core.store.store(
@@ -87,11 +92,11 @@ class Limbiq:
             embedding=embedding,
         )
 
-    def gaba(self, memory_id: str):
+    def gaba(self, memory_id: str) -> None:
         """Manually suppress a memory."""
         self._core.store.suppress(memory_id, SuppressionReason.MANUAL)
 
-    def correct(self, correction: str):
+    def correct(self, correction: str) -> None:
         """Apply a correction -- combines dopamine (new info) + gaba (old info)."""
         self.dopamine(correction)
 
@@ -107,40 +112,24 @@ class Limbiq:
         """Return all crystallized behavioral rules."""
         return self._core.rule_store.get_active_rules()
 
-    def deactivate_rule(self, rule_id: str):
-        """Deactivate a behavioral rule (reversible)."""
+    def deactivate_rule(self, rule_id: str) -> None:
         self._core.rule_store.deactivate_rule(rule_id)
 
-    def reactivate_rule(self, rule_id: str):
-        """Reactivate a previously deactivated rule."""
+    def reactivate_rule(self, rule_id: str) -> None:
         self._core.rule_store.reactivate_rule(rule_id)
 
     # -- Acetylcholine (knowledge clusters) --
 
     def get_clusters(self) -> list[KnowledgeCluster]:
-        """Return all knowledge clusters."""
         return self._core.cluster_store.get_all_clusters()
 
     def get_cluster_memories(self, cluster_id: str) -> list[Memory]:
-        """Return all memories in a cluster."""
         return self._core.cluster_store.get_cluster_memories(cluster_id)
 
     # -- Active Graph Propagation --
 
     def propagate(self) -> "PropagationResult":
-        """
-        Run a full active graph propagation cycle.
-
-        This is the Phase 1 implementation of the active knowledge graph:
-        1. Suppress noise memories
-        2. Deflate inflated priorities
-        3. Merge duplicate memories
-        4. Repair knowledge graph (extract entities from existing memories)
-        5. Run graph inference
-        6. Compute node activations
-
-        Returns PropagationResult with statistics.
-        """
+        """Run Phase 1 active graph propagation cycle."""
         prop = ActiveGraphPropagation(
             store=self._core.store,
             graph=self._core.graph,
@@ -151,12 +140,7 @@ class Limbiq:
 
     def propagate_gnn(self, model_dir: str = "data/gnn",
                       train_first: bool = False, epochs: int = 200) -> dict:
-        """
-        Run Phase 2 GNN-based propagation.
-
-        If train_first=True, trains the GNN on Phase 1 labels before propagating.
-        Falls back to Phase 1 if no trained model is found.
-        """
+        """Run Phase 2 GNN-based propagation."""
         gnn = GNNPropagation(
             store=self._core.store,
             graph=self._core.graph,
@@ -170,7 +154,6 @@ class Limbiq:
 
     def compute_activations_gnn(self, query: str = None,
                                 model_dir: str = "data/gnn") -> list:
-        """Compute GNN-based activations, optionally biased by a query."""
         gnn = GNNPropagation(
             store=self._core.store,
             graph=self._core.graph,
@@ -184,18 +167,9 @@ class Limbiq:
         return gnn.compute_activations(query_embedding)
 
     def enable_activation_retrieval(self, gnn_model_dir: str = "data/gnn") -> bool:
-        """
-        Enable Phase 4 activation-weighted retrieval.
-        Requires a trained GNN model from Phase 2.
-        Returns True if successfully enabled.
-        """
         return self._core.enable_activation_retrieval(gnn_model_dir)
 
     def generate_graph_training_data(self, output_path: str = "data/training/graph_training.jsonl") -> int:
-        """
-        Generate LoRA training data from the knowledge graph.
-        Returns the number of training pairs generated.
-        """
         from limbiq.retrieval.activation_retrieval import GraphTrainingDataGenerator
         gen = GraphTrainingDataGenerator(
             graph=self._core.graph,
@@ -207,10 +181,6 @@ class Limbiq:
 
     def run_pattern_completion(self, model_dir: str = "data/pattern",
                                train_transe: bool = True, epochs: int = 500) -> dict:
-        """
-        Run Phase 3 pattern completion: entity resolution, relation mining,
-        TransE training, and learned inference.
-        """
         pc = PatternCompletion(
             store=self._core.store,
             graph=self._core.graph,
@@ -221,11 +191,6 @@ class Limbiq:
         return pc.run(train_transe_model=train_transe, epochs=epochs)
 
     def compute_activations(self, query: str = None) -> list:
-        """
-        Compute activation states for all memory nodes.
-        Optionally bias activations toward a query.
-        Returns list of ActivationState objects sorted by activation.
-        """
         prop = ActiveGraphPropagation(
             store=self._core.store,
             graph=self._core.graph,
@@ -241,21 +206,12 @@ class Limbiq:
 
     def train_reasoner(self, model_dir: str = "data/reasoner",
                        epochs: int = 100) -> dict:
-        """
-        Train the micro-transformer graph reasoner.
-        Generates synthetic QA data from the knowledge graph and trains.
-        """
         user_name = getattr(self._core, '_graph_user_name', self._core.user_id)
         reasoner = GraphReasoner(self._core.graph, user_name=user_name,
                                  model_dir=model_dir)
         return reasoner.train(epochs=epochs)
 
     def reason(self, question: str, model_dir: str = "data/reasoner") -> "ReasoningResult":
-        """
-        Answer a question using the micro-transformer reasoner.
-        Returns ReasoningResult with answer, confidence, and reasoning trace.
-        Falls back gracefully if model not trained.
-        """
         user_name = getattr(self._core, '_graph_user_name', self._core.user_id)
         reasoner = GraphReasoner(self._core.graph, user_name=user_name,
                                  model_dir=model_dir)
@@ -263,97 +219,92 @@ class Limbiq:
 
     # -- Knowledge Graph --
 
+    def heal_graph(self) -> None:
+        """Self-heal: junk cleanup + inference + connectivity bridging."""
+        self._core.graph.heal()
+        self._core.inference_engine.run_full_inference()
+        self._core._heal_graph_connectivity()
+        self._core.graph_query.mark_dirty()
+
+    def train_encoder(self) -> dict:
+        """Train transformer entity encoder from existing graph data.
+
+        The encoder learns entity type classification and relation detection
+        from the graph built by regex+LLM extraction. After training, it
+        produces learned entity spans and types alongside embeddings.
+        """
+        return self._core.entity_extractor.train_encoder()
+
+    def get_graph_connectivity(self) -> dict:
+        """Return graph connectivity statistics."""
+        entities = self._core.graph.get_all_entities()
+        if not entities:
+            return {"components": 0, "entities": 0, "fully_connected": True}
+
+        entity_ids = {e.id for e in entities}
+        adj: dict[str, set[str]] = {eid: set() for eid in entity_ids}
+        relations = self._core.graph.get_all_relations(include_inferred=True)
+        for r in relations:
+            if r.subject_id in adj and r.object_id in adj:
+                adj[r.subject_id].add(r.object_id)
+                adj[r.object_id].add(r.subject_id)
+
+        components = self._core._find_connected_components(adj)
+        return {
+            "components": len(components),
+            "entities": len(entities),
+            "relations": len(relations),
+            "fully_connected": len(components) <= 1,
+            "component_sizes": sorted([len(c) for c in components], reverse=True),
+        }
+
     def get_graph_stats(self) -> dict:
-        """Return knowledge graph statistics."""
         return self._core.graph.get_stats()
 
     def get_entities(self) -> list:
-        """Return all entities in the knowledge graph."""
         return self._core.graph.get_all_entities()
 
     def get_relations(self, include_inferred: bool = True) -> list:
-        """Return all relations in the knowledge graph."""
         return self._core.graph.get_all_relations(include_inferred)
 
-    def delete_relation(self, subject_name: str, predicate: str, object_name: str):
-        """Delete a specific relation from the knowledge graph."""
+    def delete_relation(self, subject_name: str, predicate: str, object_name: str) -> None:
         self._core.graph.delete_relation(subject_name, predicate, object_name)
-        self._core.graph.remove_inferred()  # Re-clean inferred relations
+        self._core.graph.remove_inferred()
 
-    def delete_relations_between(self, name_a: str, name_b: str):
-        """Delete ALL relations between two entities."""
+    def delete_relations_between(self, name_a: str, name_b: str) -> None:
         self._core.graph.delete_relations_between(name_a, name_b)
         self._core.graph.remove_inferred()
 
     def query_graph(self, question: str) -> dict:
-        """Query the knowledge graph with a natural language question."""
         return self._core.graph_query.try_answer(question)
 
     def describe_entity(self, name: str) -> str:
-        """Get a natural language description of an entity."""
         return self._core.inference_engine.describe_entity(name)
 
     def get_world_summary(self) -> str:
-        """Get a compact summary of everything known about the user."""
         return self._core.inference_engine.get_user_world(self._core._graph_user_name)
-
-    # -- Hallucination Detection --
-
-    def get_hallucination_detector(self) -> "HallucinationDetector":
-        """
-        Get the hallucination detector for this instance.
-
-        Usage in an engine:
-            detector = lq.get_hallucination_detector()
-
-            # Before LLM generation:
-            grounding = detector.pre_generate(query, graph_result, ...)
-
-            # After LLM generation:
-            verification = detector.post_generate(response, user_name, query)
-
-            # Check if regeneration needed:
-            if detector.should_regenerate(verification):
-                correction = detector.correction_prompt(verification, query)
-                # ... regenerate with correction ...
-        """
-        if not hasattr(self, '_hallucination_detector'):
-            self._hallucination_detector = HallucinationDetector(
-                graph_store=self._core.graph,
-                memory_store=self._core.store,
-                embedding_engine=self._core.embeddings,
-                signal_log=self._core.signal_log,
-            )
-        return self._hallucination_detector
 
     # -- Inspection --
 
     def get_stats(self) -> dict:
-        """Return memory statistics."""
         return self._core.store.get_stats()
 
     def get_signal_log(self, limit: int = 50) -> list[SignalEvent]:
-        """Return recent signal events."""
         return self._core.signal_log.get_recent(limit)
 
     def get_priority_memories(self) -> list[Memory]:
-        """Return all dopamine-tagged priority memories."""
         return self._core.store.get_priority_memories()
 
     def get_suppressed(self) -> list[Memory]:
-        """Return all GABA-suppressed memories."""
         return self._core.store.get_suppressed()
 
-    def restore_memory(self, memory_id: str):
-        """Undo a GABA suppression."""
+    def restore_memory(self, memory_id: str) -> None:
         self._core.store.restore(memory_id)
 
     def export_state(self) -> dict:
-        """Export full state as JSON for debugging."""
         return self._core.store.export_all()
 
     def get_full_profile(self) -> dict:
-        """Return a complete user profile."""
         return {
             "priority_facts": [
                 {"id": m.id, "content": m.content}
@@ -391,25 +342,12 @@ __all__ = [
     "BehavioralRule",
     "KnowledgeCluster",
     "RetrievalConfig",
-    # Onboarding
-    "OnboardingManager",
-    "AgentProfile",
-    # Tools
-    "ToolRegistry",
-    "BaseTool",
-    "ToolResult",
-    "FileReaderTool",
-    "TerminalTool",
-    "CalculatorTool",
-    "format_tool_results",
-    # Model routing
-    "ModelRouter",
-    # Hallucination detection
-    "HallucinationDetector",
-    "GroundingAnalyzer",
-    "FactVerifier",
-    "GroundingReport",
-    "GroundingLevel",
-    "VerificationReport",
-    "ClaimStatus",
+    # Graph propagation
+    "ActiveGraphPropagation",
+    "PropagationResult",
+    "GNNPropagation",
+    "PatternCompletion",
+    # Graph reasoning
+    "GraphReasoner",
+    "ReasoningResult",
 ]

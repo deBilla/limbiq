@@ -7,11 +7,15 @@ Two modes:
 """
 
 import math
+import threading
 from collections import Counter
 
 
 class EmbeddingEngine:
     def __init__(self, model_name: str = "all-MiniLM-L6-v2", custom_fn=None):
+        self._cache = {}
+        self._cache_max = 500
+        self._lock = threading.Lock()
         if custom_fn:
             self.embed = custom_fn
             self._mode = "custom"
@@ -24,19 +28,48 @@ class EmbeddingEngine:
                 # which owns the GPU for LLM inference.
                 device = "cpu" if platform.machine() == "arm64" else None
                 self._model = SentenceTransformer(model_name, device=device)
-                self.embed = self._transformer_embed
+                self.embed = self._cached_transformer_embed
                 self._mode = "transformer"
             except ImportError:
-                self.embed = self._tfidf_embed
+                self.embed = self._cached_tfidf_embed
                 self._mode = "tfidf"
                 self._vocab: dict[str, int] = {}
                 self._vocab_size = 512
 
-    def _transformer_embed(self, text: str) -> list[float]:
-        return self._model.encode(text).tolist()
+    def _cached_transformer_embed(self, text: str) -> list[float]:
+        """Transformer embedding with caching (thread-safe)."""
+        with self._lock:
+            if text in self._cache:
+                return self._cache[text]
 
-    def _tfidf_embed(self, text: str) -> list[float]:
-        """Simple bag-of-words fallback when sentence-transformers isn't installed."""
+            result = self._model.encode(text).tolist()
+
+            # Cache result
+            if len(self._cache) >= self._cache_max:
+                # Remove oldest entry
+                oldest = next(iter(self._cache))
+                del self._cache[oldest]
+            self._cache[text] = result
+            return result
+
+    def _cached_tfidf_embed(self, text: str) -> list[float]:
+        """TF-IDF embedding with caching (thread-safe)."""
+        with self._lock:
+            if text in self._cache:
+                return self._cache[text]
+
+            result = self._tfidf_embed_impl(text)
+
+            # Cache result
+            if len(self._cache) >= self._cache_max:
+                # Remove oldest entry
+                oldest = next(iter(self._cache))
+                del self._cache[oldest]
+            self._cache[text] = result
+            return result
+
+    def _tfidf_embed_impl(self, text: str) -> list[float]:
+        """Actual TF-IDF implementation."""
         tokens = text.lower().split()
         counts = Counter(tokens)
 

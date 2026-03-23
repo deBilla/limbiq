@@ -32,6 +32,7 @@ class ContextBuilder:
         graph_answer: str = None,
         world_summary: str = None,
         search_results: list = None,
+        graph_context: str = None,
     ) -> str:
         # ── Build candidate sections ──────────────────────────────────────────
 
@@ -47,6 +48,11 @@ class ContextBuilder:
 
         if graph_answer:
             mandatory_sections.append(f"[KNOWN FACT] {graph_answer}")
+
+        if graph_context:
+            mandatory_sections.append(
+                f"[GRAPH KNOWLEDGE — relationships known about entities mentioned]\n{graph_context}"
+            )
 
         if world_summary:
             mandatory_sections.append(f"[ABOUT YOU] {world_summary}")

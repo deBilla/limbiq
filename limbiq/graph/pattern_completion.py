@@ -44,14 +44,20 @@ class EntityResolver:
     """
     Merge duplicate entities in the graph.
 
-    Primary job: resolve "default" (limbiq's internal user_id) into
-    the actual user name, reassigning all relations.
-    Also handles other duplicate entities (case variants, etc.)
+    Three resolution strategies (in order):
+    1. Canonical merges — "default" → actual user name
+    2. Case-insensitive duplicates — "dimuthu" → "Dimuthu"
+    3. Embedding-based semantic merges — "Dog" + "Dexter" when
+       structural + semantic signals indicate same entity.
+       No hardcoded lists. Uses embedding similarity + graph
+       neighborhood overlap to detect merge candidates.
     """
 
-    def __init__(self, graph: GraphStore, user_name: str = "Dimuthu"):
+    def __init__(self, graph: GraphStore, user_name: str = "Dimuthu",
+                 embedding_engine=None):
         self.graph = graph
         self.user_name = user_name
+        self.embeddings = embedding_engine
 
     def resolve(self) -> dict:
         """Run full entity resolution. Returns stats."""
@@ -63,7 +69,10 @@ class EntityResolver:
         # 2. Merge case-insensitive duplicates
         stats.update(self._merge_case_duplicates())
 
-        # 3. Remove orphaned entities (no relations)
+        # 3. Embedding-based semantic entity resolution
+        stats["semantic_merges"] = self._semantic_entity_resolution()
+
+        # 4. Remove orphaned entities (no relations)
         stats["orphans_removed"] = self._remove_orphans()
 
         return stats
@@ -160,6 +169,248 @@ class EntityResolver:
                 removed += 1
         self.graph.db.commit()
         return removed
+
+    def _semantic_entity_resolution(self) -> int:
+        """
+        Embedding-based entity resolution — NO hardcoded lists.
+
+        For each pair of entities connected to the same parent via
+        the same predicate, compute a merge score:
+
+          score = w_struct * structural_sim + w_embed * embedding_sim
+
+        structural_sim: Jaccard overlap of neighbor predicates.
+          "Dog" has {pet(incoming), has_condition(outgoing)}
+          "Dexter" has {has_condition(outgoing)}
+          overlap = |{has_condition}| / |{pet, has_condition}| = 0.5
+
+        embedding_sim: cosine similarity of entity name embeddings.
+          embed("Dog") vs embed("Dexter") — in pet context, these
+          cluster closer than you'd expect because sentence-transformers
+          encode semantic role, not just lexical surface.
+
+        Context-enriched embedding: Instead of just the name, we embed
+          "Dog: animal, pet of Dimuthu, has_condition megaesophagus"
+          vs "Dexter: person, has_condition vomited"
+          This captures the graph context, making structural similarity
+          available to the embedding model too.
+
+        Merge threshold: score > 0.6 (tunable)
+        """
+        if not self.embeddings:
+            return 0
+
+        entities = self.graph.get_all_entities()
+        if len(entities) < 2:
+            return 0
+
+        entities_by_id = {e.id: e for e in entities}
+        all_relations = self.graph.get_all_relations(include_inferred=False)
+
+        # Build adjacency: entity_id → [(predicate, direction, neighbor_id)]
+        adjacency = defaultdict(list)
+        for r in all_relations:
+            adjacency[r.subject_id].append((r.predicate, "out", r.object_id))
+            adjacency[r.object_id].append((r.predicate, "in", r.subject_id))
+
+        # Build context-enriched descriptions for each entity
+        def _entity_context(eid: str) -> str:
+            e = entities_by_id.get(eid)
+            if not e:
+                return ""
+            parts = [f"{e.name}: {e.entity_type}"]
+            for pred, direction, neighbor_id in adjacency.get(eid, []):
+                neighbor = entities_by_id.get(neighbor_id)
+                if neighbor:
+                    if direction == "out":
+                        parts.append(f"{pred} {neighbor.name}")
+                    else:
+                        parts.append(f"{pred} of {neighbor.name}")
+            return ", ".join(parts)
+
+        # Find merge candidates: entities sharing a parent via the same predicate
+        # e.g., both "Dog" and "Dexter" are objects of "pet" from "Dimuthu"
+        # OR both have "has_condition" as an outgoing predicate
+        # This is much broader than just pets — it catches any duplicates.
+        candidates = []
+
+        # Strategy 1: same parent + same predicate (strongest signal)
+        parent_groups = defaultdict(list)  # (parent_id, predicate) → [object entities]
+        for r in all_relations:
+            parent_groups[(r.subject_id, r.predicate)].append(r.object_id)
+
+        for (parent_id, pred), obj_ids in parent_groups.items():
+            if len(obj_ids) < 2:
+                continue
+            for i in range(len(obj_ids)):
+                for j in range(i + 1, len(obj_ids)):
+                    eid_a, eid_b = obj_ids[i], obj_ids[j]
+                    if eid_a != eid_b:
+                        candidates.append((eid_a, eid_b, "same_parent_pred"))
+
+        # Strategy 2: entities with high predicate overlap but no shared parent
+        pred_sets = {}
+        for eid in adjacency:
+            preds = set()
+            for pred, direction, _ in adjacency[eid]:
+                preds.add(f"{pred}_{direction}")
+            pred_sets[eid] = preds
+
+        entity_ids = list(pred_sets.keys())
+        for i in range(len(entity_ids)):
+            for j in range(i + 1, len(entity_ids)):
+                eid_a, eid_b = entity_ids[i], entity_ids[j]
+                preds_a, preds_b = pred_sets[eid_a], pred_sets[eid_b]
+                if preds_a and preds_b:
+                    jaccard = len(preds_a & preds_b) / len(preds_a | preds_b)
+                    if jaccard >= 0.5:
+                        candidates.append((eid_a, eid_b, "pred_overlap"))
+
+        if not candidates:
+            return 0
+
+        # Deduplicate candidates
+        seen = set()
+        unique_candidates = []
+        for eid_a, eid_b, reason in candidates:
+            key = (min(eid_a, eid_b), max(eid_a, eid_b))
+            if key not in seen:
+                seen.add(key)
+                unique_candidates.append((eid_a, eid_b, reason))
+
+        # Count entities by type (rarity signal)
+        type_counts = defaultdict(int)
+        for e in entities:
+            type_counts[e.entity_type] += 1
+
+        # Score each candidate pair
+        merged = 0
+        merge_pairs = []
+
+        for eid_a, eid_b, reason in unique_candidates:
+            ea = entities_by_id.get(eid_a)
+            eb = entities_by_id.get(eid_b)
+            if not ea or not eb:
+                continue
+
+            # Don't merge the user with anything
+            if ea.name.lower() == self.user_name.lower() or \
+               eb.name.lower() == self.user_name.lower():
+                continue
+
+            # Structural similarity: Jaccard of predicate neighborhoods
+            preds_a = pred_sets.get(eid_a, set())
+            preds_b = pred_sets.get(eid_b, set())
+            if preds_a or preds_b:
+                struct_sim = len(preds_a & preds_b) / len(preds_a | preds_b)
+            else:
+                struct_sim = 0.0
+
+            # Embedding similarity: context-enriched entity descriptions
+            ctx_a = _entity_context(eid_a)
+            ctx_b = _entity_context(eid_b)
+            emb_a = np.array(self.embeddings.embed(ctx_a), dtype=np.float32)
+            emb_b = np.array(self.embeddings.embed(ctx_b), dtype=np.float32)
+            norm_a = np.linalg.norm(emb_a)
+            norm_b = np.linalg.norm(emb_b)
+            if norm_a > 0 and norm_b > 0:
+                embed_sim = float(np.dot(emb_a / norm_a, emb_b / norm_b))
+            else:
+                embed_sim = 0.0
+
+            # ── Type-aware scoring ──
+            # Same entity type is a strong signal, especially for rare types.
+            # Two "animal" entities in a personal graph are very likely the same.
+            # Two "concept" entities are usually different (megaesophagus ≠ vomited).
+            same_type = ea.entity_type == eb.entity_type
+            type_bonus = 0.0
+
+            if same_type:
+                shared_type = ea.entity_type
+                count = type_counts.get(shared_type, 0)
+
+                if shared_type in ("concept", "place", "company"):
+                    # Concepts/places/companies: high structural overlap is
+                    # NOT enough — many concepts share the same graph shape.
+                    # Require high embedding similarity to merge.
+                    if embed_sim < 0.75:
+                        continue  # Skip: different concepts, similar structure
+                else:
+                    # Rare types (animal, etc.): same type + any structural
+                    # overlap is a strong merge signal in a small personal graph.
+                    # Two animals sharing predicates are almost certainly the same.
+                    if count <= 2:
+                        type_bonus = 0.30  # Strong rarity bonus
+                    elif count <= 4:
+                        type_bonus = 0.15
+                    else:
+                        type_bonus = 0.05
+
+            # Combined score
+            score = 0.35 * struct_sim + 0.45 * embed_sim + type_bonus
+
+            # Bonus for same-parent-same-predicate (strongest structural signal)
+            if reason == "same_parent_pred":
+                score += 0.15
+
+            if score > 0.6:
+                merge_pairs.append((eid_a, eid_b, ea, eb, score, reason))
+                logger.info(
+                    f"  Entity merge candidate: '{ea.name}' + '{eb.name}' "
+                    f"(score={score:.2f}, struct={struct_sim:.2f}, "
+                    f"embed={embed_sim:.2f}, type_bonus={type_bonus:.2f}, "
+                    f"reason={reason})"
+                )
+
+        # Execute merges: keep the entity with more relations (or proper name)
+        for eid_a, eid_b, ea, eb, score, reason in merge_pairs:
+            rels_a = len(self.graph.get_relations_for(eid_a))
+            rels_b = len(self.graph.get_relations_for(eid_b))
+
+            # Prefer the "more proper" name: longer name, more relations,
+            # or capitalized name over generic lowercase
+            if rels_a >= rels_b:
+                keep, drop = ea, eb
+                keep_id, drop_id = eid_a, eid_b
+            else:
+                keep, drop = eb, ea
+                keep_id, drop_id = eid_b, eid_a
+
+            # If one looks like a proper name and the other is generic, prefer proper
+            a_is_proper = ea.name[0].isupper() and len(ea.name) > 3
+            b_is_proper = eb.name[0].isupper() and len(eb.name) > 3
+            if b_is_proper and not a_is_proper:
+                keep, drop = eb, ea
+                keep_id, drop_id = eid_b, eid_a
+            elif a_is_proper and not b_is_proper:
+                keep, drop = ea, eb
+                keep_id, drop_id = eid_a, eid_b
+
+            # Transfer all relations from drop → keep
+            self.graph.db.execute(
+                "UPDATE relations SET subject_id = ? WHERE subject_id = ?",
+                (keep_id, drop_id)
+            )
+            self.graph.db.execute(
+                "UPDATE relations SET object_id = ? WHERE object_id = ?",
+                (keep_id, drop_id)
+            )
+            # Remove duplicate relations that might result
+            self.graph.db.execute("""
+                DELETE FROM relations WHERE rowid NOT IN (
+                    SELECT MIN(rowid) FROM relations
+                    GROUP BY subject_id, predicate, object_id
+                )
+            """)
+            # Delete the dropped entity
+            self.graph.db.execute("DELETE FROM entities WHERE id = ?", (drop_id,))
+            merged += 1
+            logger.info(f"  Merged '{drop.name}' into '{keep.name}' (score={score:.2f})")
+
+        if merged > 0:
+            self.graph.db.commit()
+
+        return merged
 
 
 # ─── Graph Cleanup ──────────────────────────────────────────────
@@ -423,9 +674,6 @@ class RelationMiner:
         (r"(\w+)\s+(?:is\s+)?married\s+to\s+(\w+)", "married"),
     ]
 
-    # Known entity names to validate extractions
-    KNOWN_ENTITIES = {"Dimuthu", "Prabhashi", "Upananda", "Renuka", "Dilini", "Dilani", "Dilanka"}
-
     def __init__(self, graph: GraphStore, store_db, user_name: str = "Dimuthu"):
         self.graph = graph
         self.store_db = store_db
@@ -433,6 +681,9 @@ class RelationMiner:
 
     def mine_relations(self) -> dict:
         """Mine all memories for missing relations. Returns stats."""
+        # Build known entities dynamically from graph
+        known_entities = {e.name for e in self.graph.get_all_entities()}
+
         # Get all non-suppressed memories
         rows = self.store_db.execute(
             "SELECT id, content FROM memories WHERE is_suppressed = 0"
@@ -451,16 +702,16 @@ class RelationMiner:
                     if rel_type == "sister_pair":
                         names = [match.group(1), match.group(2)]
                         for name in names:
-                            if name in self.KNOWN_ENTITIES:
+                            if name in known_entities:
                                 found_relations.add((self.user_name, "sister", name, mem_id))
                     elif rel_type == "married":
                         name_a, name_b = match.group(1), match.group(2)
-                        if name_a in self.KNOWN_ENTITIES and name_b in self.KNOWN_ENTITIES:
+                        if name_a in known_entities and name_b in known_entities:
                             found_relations.add((name_a, "husband", name_b, mem_id))
                             found_relations.add((name_b, "wife", name_a, mem_id))
                     else:
                         name = match.group(1)
-                        if name in self.KNOWN_ENTITIES:
+                        if name in known_entities:
                             found_relations.add((self.user_name, rel_type, name, mem_id))
 
         # Also scan suppressed memories for family facts (they may have been
@@ -475,16 +726,16 @@ class RelationMiner:
                     if rel_type == "sister_pair":
                         names = [match.group(1), match.group(2)]
                         for name in names:
-                            if name in self.KNOWN_ENTITIES:
+                            if name in known_entities:
                                 found_relations.add((self.user_name, "sister", name, mem_id))
                     elif rel_type == "married":
                         name_a, name_b = match.group(1), match.group(2)
-                        if name_a in self.KNOWN_ENTITIES and name_b in self.KNOWN_ENTITIES:
+                        if name_a in known_entities and name_b in known_entities:
                             found_relations.add((name_a, "husband", name_b, mem_id))
                             found_relations.add((name_b, "wife", name_a, mem_id))
                     elif rel_type in ("mother", "father", "sister", "wife"):
                         name = match.group(1)
-                        if name in self.KNOWN_ENTITIES:
+                        if name in known_entities:
                             found_relations.add((self.user_name, rel_type, name, mem_id))
 
         # Add found relations to graph
@@ -981,14 +1232,15 @@ class PatternCompletion:
         print(f"    Contradictions fixed:     {cleanup_stats['contradictions_fixed']}")
         print(f"    Dangling relations removed: {cleanup_stats['dangling_relations_removed']}")
 
-        # Step 1: Entity resolution
+        # Step 1: Entity resolution (embedding-based)
         print("\n  [1/5] Entity Resolution...")
-        resolver = EntityResolver(self.graph, self.user_name)
+        resolver = EntityResolver(self.graph, self.user_name, self.embeddings)
         resolve_stats = resolver.resolve()
         results["entity_resolution"] = resolve_stats
         print(f"    Merged: {resolve_stats['merged']}, "
               f"Reassigned: {resolve_stats['relations_reassigned']}, "
               f"Duplicates: {resolve_stats['duplicates_removed']}, "
+              f"Semantic merges: {resolve_stats.get('semantic_merges', 0)}, "
               f"Orphans: {resolve_stats['orphans_removed']}")
 
         # Step 2: Mine relations from memories

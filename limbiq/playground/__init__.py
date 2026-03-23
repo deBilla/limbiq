@@ -1,5 +1,5 @@
 """
-Limbiq Playground — Interactive dashboard for exploring and debugging limbiq.
+Limbiq Playground — Interactive dashboard for signals + graph.
 
 Usage:
     python -m limbiq.playground [OPTIONS]
