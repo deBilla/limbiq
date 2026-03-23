@@ -268,15 +268,19 @@ class LimbiqCore:
             ent_msg_future = pool.submit(
                 self.entity_extractor.extract_from_memory, message
             )
-            # NOTE: We intentionally do NOT extract entities from the LLM
-            # response. The user message is the source of truth for entities
-            # and relationships. LLM responses echo back information (often
-            # rephrased) and contain non-entity words ("Understood", "Here",
-            # "Following") that pollute the graph.
+            # Also extract from LLM response — it often confirms/clarifies
+            # relationships ("your father-in-law Chandrasiri"). In response_mode,
+            # only relations between existing graph entities are kept —
+            # no new entities from response filler.
+            ent_resp_future = pool.submit(
+                self.entity_extractor.extract_from_memory,
+                response, "", True,  # response_mode=True
+            )
 
             serotonin_events = sero_future.result()
             ach_events = ach_future.result()
             ent_msg_future.result()
+            ent_resp_future.result()
 
         # Graph correction AFTER extraction
         if _is_correction:

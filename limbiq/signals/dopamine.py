@@ -172,6 +172,18 @@ class DopamineSignal(BaseSignal):
 
         elif event.trigger == "novel_personal_info":
             embedding = embeddings.embed(message)
+
+            # Deduplicate: skip if a similar priority memory already exists
+            existing_priority = memory_store.search(embedding, top_k=3)
+            for m in existing_priority:
+                if m.is_priority:
+                    sim = embeddings.similarity(embedding, embeddings.embed(m.content))
+                    if sim > 0.92:
+                        # Near-duplicate — skip storage, just boost existing
+                        memory_store.boost_confidence(m.id, 1.0)
+                        event.memory_ids_affected.append(m.id)
+                        return
+
             mem = memory_store.store(
                 content=message,
                 tier=MemoryTier.PRIORITY,

@@ -473,9 +473,21 @@ class EntityExtractor:
                 name=user_name, entity_type="person",
             ))
 
-    def extract_from_memory(self, memory_content: str, memory_id: str = "") -> dict:
+    def extract_from_memory(
+        self, memory_content: str, memory_id: str = "",
+        response_mode: bool = False,
+    ) -> dict:
         """
         Extract entities and relations from text.
+
+        Args:
+            memory_content: Text to extract from.
+            memory_id: Optional memory ID for provenance.
+            response_mode: If True, only extract relations between entities
+                that already exist in the graph. This prevents LLM response
+                artifacts ("stay in touch", "quite serious") from polluting
+                the graph while still capturing confirmed relationships
+                ("your father-in-law Chandrasiri").
 
         Hybrid pipeline:
         0. Transformer encoder pass (produces embeddings for all extracted entities)
@@ -488,7 +500,7 @@ class EntityExtractor:
         # Phase 0: Transformer encoder pass — produces entity embeddings
         # and optional learned entity/relation detection
         encoder_output = None
-        if self._encoder is not None:
+        if not response_mode and self._encoder is not None:
             try:
                 from limbiq.graph.encoder import EncoderOutput
                 encoder_output = self._encoder.encode(memory_content, self.user_name)
@@ -499,8 +511,10 @@ class EntityExtractor:
         uncertain = []
         if self.nlp:
             # Tier 1: Dependency-based extraction (primary)
+            # In response_mode, same pipeline runs but entity creation is
+            # gated — only entities already in the graph get new relations.
             result, uncertain = self._extract_from_dependencies(
-                memory_content, memory_id
+                memory_content, memory_id, create_new_entities=not response_mode,
             )
         else:
             # Fallback: Regex-based extraction (when spaCy unavailable)
@@ -510,19 +524,20 @@ class EntityExtractor:
             )
 
         # Tier 2: LLM resolution for uncertain fragments
-        if uncertain and self.llm_fn:
+        if uncertain and self.llm_fn and not response_mode:
             self._resolve_uncertain_with_llm(uncertain, result, memory_id)
 
         # Register orphan spaCy NER entities (names without relations)
-        spacy_entities = self._extract_spacy(memory_content)
-        self._register_orphan_entities(spacy_entities, result, memory_id)
+        if not response_mode:
+            spacy_entities = self._extract_spacy(memory_content)
+            self._register_orphan_entities(spacy_entities, result, memory_id)
 
         # Merge encoder output — attach embeddings to extracted entities
         if encoder_output is not None:
             self._merge_encoder_output(encoder_output, result, memory_id)
 
         # Queue for deep LLM extraction (runs in background)
-        if self.llm_fn and len(memory_content.strip()) > 20:
+        if self.llm_fn and len(memory_content.strip()) > 20 and not response_mode:
             self._pending_extractions.append((memory_content, memory_id))
             logger.info(f"Queued for LLM extraction ({len(self._pending_extractions)} pending): {memory_content[:60]}...")
 
@@ -657,7 +672,8 @@ class EntityExtractor:
 
     # ── Tier 1: Dependency-based extraction ────────────────────
 
-    def _extract_from_dependencies(self, text: str, memory_id: str) -> tuple[dict, list[str]]:
+    def _extract_from_dependencies(self, text: str, memory_id: str,
+                                    create_new_entities: bool = True) -> tuple[dict, list[str]]:
         """
         Tier 1: Extract entities and relations using spaCy dependency parsing.
 
@@ -687,6 +703,8 @@ class EntityExtractor:
 
             subj = self.graph.find_entity_by_name(subj_name)
             if not subj:
+                if not create_new_entities:
+                    continue
                 subj = self.graph.add_entity(Entity(
                     name=subj_name, entity_type="person",
                     source_memory_id=memory_id,
@@ -697,6 +715,8 @@ class EntityExtractor:
 
             obj = self.graph.find_entity_by_name(obj_name)
             if not obj:
+                if not create_new_entities:
+                    continue
                 obj = self.graph.add_entity(Entity(
                     name=obj_name, entity_type=obj_type,
                     source_memory_id=memory_id,
@@ -775,6 +795,8 @@ class EntityExtractor:
 
             obj = self.graph.find_entity_by_name(obj_name)
             if not obj:
+                if not create_new_entities:
+                    continue
                 obj = self.graph.add_entity(Entity(
                     name=obj_name, entity_type=obj_type,
                     source_memory_id=memory_id,
@@ -813,6 +835,7 @@ class EntityExtractor:
         for token in doc:
             if token.dep_ != 'poss':
                 continue
+
             # Accept first-person possessives and user-name possessives
             # ("my wife", "our dog", "User's father", "Dimuthu's wife")
             is_first_person = token.text.lower() in ('my', 'our')
@@ -821,20 +844,45 @@ class EntityExtractor:
             ) or token.text.lower().rstrip("'s") in (
                 'user', self.user_name.lower()
             )
-            if not is_first_person and not is_user_ref:
+            # Also accept "your" (from LLM response: "your father-in-law")
+            is_second_person = token.text.lower() in ('your', 'you')
+
+            # Third-person possessives: resolve "her/his/their" to the
+            # nearest preceding entity in the same sentence.
+            # "My wife was ... with her father Chandrasiri"
+            #   → "her" resolves to "wife" → chain: wife.father = father_in_law
+            is_third_person_resolved = False
+            resolved_antecedent = None
+            if token.text.lower() in ('her', 'his', 'their'):
+                resolved_antecedent = self._resolve_pronoun(token, doc)
+                if resolved_antecedent:
+                    is_third_person_resolved = True
+
+            if not (is_first_person or is_user_ref or is_second_person
+                    or is_third_person_resolved):
                 continue
 
             head = token.head
             if head.i in processed_heads:
                 continue
 
-            # Check if the DIRECT head of "my" is a relation/pet word.
+            # Check if the DIRECT head is a relation/pet word.
             # "my wife Prabhashi" → head=wife (relation word) → proceed
             # "my Dog has..." → head=Dog (pet word) → pet entity
             # "my dogs health" → head=health (not a relation) → skip
             head_norm = _normalize_predicate(head.lemma_.lower())
             head_is_relation = head_norm in VALID_PREDICATES or head.lemma_.lower() in RELATION_ALIASES
+
+            # Special case: "My Dog dexter" → head=dexter (not a relation word),
+            # but has a compound child "Dog" that IS a pet word.
+            # Treat this as a named pet: pet → Dexter.
             if not head_is_relation:
+                pet_compound = self._check_pet_compound(head)
+                if pet_compound:
+                    name = self._collect_name_span(head, doc)
+                    if name and _is_valid_entity_name(name):
+                        results.append((self.user_name, "pet", _cap(name), "animal", 0.95))
+                        processed_heads.add(head.i)
                 continue
 
             # Build the relation chain by walking UP through the tree
@@ -847,8 +895,15 @@ class EntityExtractor:
             for t in chain:
                 processed_heads.add(t.i)
 
-            # Resolve the chain into a single predicate
+            # Resolve the chain into a single predicate.
+            # If pronoun was resolved (e.g., "her" → "wife"), prepend the
+            # antecedent's relation to form a chain: wife + father → father_in_law
             pred_words = [_normalize_predicate(t.lemma_.lower()) for t in chain]
+            if is_third_person_resolved and resolved_antecedent:
+                antecedent_pred = _normalize_predicate(resolved_antecedent)
+                if antecedent_pred in VALID_PREDICATES:
+                    pred_words.insert(0, antecedent_pred)
+
             valid_preds = [p for p in pred_words if p in VALID_PREDICATES]
 
             if not valid_preds:
@@ -1171,6 +1226,56 @@ class EntityExtractor:
         elif predicate in ("has_condition", "diagnosed_with", "is_a"):
             return "concept"
         return "person"
+
+    def _resolve_pronoun(self, pron_token, doc) -> Optional[str]:
+        """
+        Resolve a third-person pronoun (her/his/their) to the nearest
+        preceding entity in the same sentence that could be its antecedent.
+
+        For "My wife was ... with her father Chandrasiri":
+          "her" → looks back → finds "wife" (a relation word with poss "my")
+          → returns "wife" so the caller can chain: wife.father = father_in_law
+
+        Returns the relation word (lemma) of the antecedent, or None.
+        """
+        # Gender agreement: her → female relations, his → male relations
+        female_rels = {'wife', 'mother', 'sister', 'daughter', 'grandmother', 'aunt'}
+        male_rels = {'husband', 'father', 'brother', 'son', 'grandfather', 'uncle'}
+
+        pron = pron_token.text.lower()
+        if pron in ('her', 'she'):
+            candidate_rels = female_rels
+        elif pron in ('his', 'he'):
+            candidate_rels = male_rels
+        else:
+            candidate_rels = female_rels | male_rels  # "their"
+
+        # Scan backwards from the pronoun looking for a relation word
+        # that has "my/our" as a possessive modifier
+        for i in range(pron_token.i - 1, -1, -1):
+            tok = doc[i]
+            lemma = tok.lemma_.lower()
+            norm = _normalize_predicate(lemma)
+            if norm in candidate_rels:
+                # Check that this token has "my/our" as possessive
+                has_my = any(
+                    c.dep_ == 'poss' and c.text.lower() in ('my', 'our')
+                    for c in tok.children
+                )
+                if has_my:
+                    return lemma
+        return None
+
+    def _check_pet_compound(self, head_token) -> bool:
+        """
+        Check if head_token has a compound child that's a pet word.
+        Handles: "My Dog dexter" → head=dexter, Dog is compound child.
+        """
+        pet_words = {'dog', 'cat', 'pet'}
+        for child in head_token.children:
+            if child.dep_ == 'compound' and child.lemma_.lower() in pet_words:
+                return True
+        return False
 
     # ── Tier 2: LLM resolution for uncertain extractions ──────
 
