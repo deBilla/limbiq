@@ -1,23 +1,31 @@
 # Limbiq
 
-Neurotransmitter-inspired adaptive learning layer for LLMs.
+Neurotransmitter-inspired adaptive memory layer for LLMs.
 
-Limbiq makes any LLM appear to learn and adapt across conversations — without touching a single weight. It sits between the user and the LLM, modifying what the model sees through five discrete signal types inspired by human brain chemistry.
+Limbiq sits between the user and any LLM, enriching context with learned memories, behavioral rules, and knowledge graph facts — all without modifying model weights. Five signal types inspired by human brain chemistry control what gets remembered, suppressed, clustered, or flagged.
 
 ```
-User → Limbiq → Modified Context → Any LLM → Response → Limbiq observes → Loop
+User Message → Limbiq.process() → Enriched Context → Any LLM → Response → Limbiq.observe() → Loop
 ```
 
 ## Installation
 
 ```bash
-pip install limbiq                    # Core — text-based signals + knowledge graph
-pip install limbiq[steering-mlx]      # + MLX activation steering (Apple Silicon)
+pip install limbiq                    # Core library
+pip install limbiq[faiss]             # + FAISS vector search (recommended)
+pip install limbiq[dev]               # + pytest
+pip install limbiq[playground]        # + FastAPI web dashboard
+```
+
+Limbiq requires Python 3.10+ and downloads the `all-MiniLM-L6-v2` sentence-transformer model (~80MB) on first run.
+
+For entity extraction, install the spaCy model:
+
+```bash
+python -m spacy download en_core_web_sm
 ```
 
 ## Quick Start
-
-### As a library
 
 ```python
 from limbiq import Limbiq
@@ -25,122 +33,45 @@ from limbiq import Limbiq
 lq = Limbiq(
     store_path="./neuro_data",
     user_id="dimuthu",
+    llm_fn=my_llm,  # Any callable(str) -> str, or None for heuristic mode
 )
 
-# Before sending to LLM — get enriched context
-result = lq.process(
-    message="What's my wife's name?",
-    conversation_history=[
-        {"role": "user", "content": "Hi there"},
-        {"role": "assistant", "content": "Hello! How can I help?"},
-    ],
-)
+# Before sending to LLM — retrieve memories and build context
+result = lq.process("What's my wife's name?")
 
 # Inject result.context into your system prompt
 messages = [
     {"role": "system", "content": f"You are a helpful assistant.\n\n{result.context}"},
     {"role": "user", "content": "What's my wife's name?"},
 ]
-response = my_llm(messages)  # Any LLM
+response = my_llm(messages)
 
 # After getting response — let Limbiq observe and learn
 lq.observe("What's my wife's name?", response)
 
-# End session — triggers memory compression + graph inference
+# End session — graph inference, entity resolution, memory aging
 lq.end_session()
 ```
 
-### With the built-in LLM client
-
-Limbiq includes a generic LLM client that works with any OpenAI-compatible API — Ollama, OpenAI, Claude (via proxy), vLLM, LM Studio, etc.
-
-```python
-from limbiq import Limbiq, LLMClient
-
-# Connect to Ollama
-llm = LLMClient(base_url="http://localhost:11434/v1", model="llama3.1")
-
-# Connect to OpenAI
-llm = LLMClient(base_url="https://api.openai.com/v1", model="gpt-4o", api_key="sk-...")
-
-# Pass to Limbiq — enables LLM-powered compression, entity extraction, and pattern detection
-lq = Limbiq(store_path="./data", user_id="dimuthu", llm_fn=llm)
-```
-
-## Playground
-
-Limbiq ships with an interactive web dashboard for exploring the knowledge graph, chatting, and inspecting signals.
-
-```bash
-# Basic — heuristic mode (no LLM needed)
-python -m limbiq.playground
-
-# With Ollama
-python -m limbiq.playground --llm-url http://localhost:11434/v1 --llm-model llama3.1
-
-# With Ollama + web search (SearXNG)
-python -m limbiq.playground \
-  --llm-url http://localhost:11434/v1 --llm-model llama3.1 \
-  --search-url http://localhost:8888
-
-# With OpenAI
-python -m limbiq.playground --llm-url https://api.openai.com/v1 --llm-model gpt-4o --llm-api-key sk-...
-
-# With any OpenAI-compatible API (vLLM, LM Studio, etc.)
-python -m limbiq.playground --llm-url http://localhost:8000/v1 --llm-model my-model
-```
-
-The playground includes:
-- **Chat** — talk to limbiq and watch it learn in real time (uses LLM if connected)
-- **Web Search** — auto-searches when the LLM doesn't know something, or use `/search` prefix
-- **Knowledge Graph** — interactive D3 visualization of entities and relations
-- **Entity Explorer** — browse entities and their relationships
-- **Query Builder** — test graph queries, memory retrieval, and the reasoner side by side
-- **Traces** — OpenTelemetry trace viewer for debugging
-
-Open `http://localhost:8765` after starting.
-
-### Web Search
-
-When connected, limbiq auto-detects LLM uncertainty and searches the web. Results are injected as context, the LLM re-answers, and findings are stored as memories for future queries.
-
-```bash
-# Self-hosted with SearXNG (free, recommended)
-docker run -d -p 8888:8080 searxng/searxng
-python -m limbiq.playground --search-url http://localhost:8888 ...
-
-# Brave Search (free tier: 2000 queries/month)
-python -m limbiq.playground --search-url https://api.search.brave.com --search-provider brave --search-api-key BSA-...
-
-# Tavily (free tier: 1000 queries/month)
-python -m limbiq.playground --search-url https://api.tavily.com --search-provider tavily --search-api-key tvly-...
-```
-
-Use `/search` prefix in chat to force a search: `/search latest SpaceX launch`
-
-Programmatic usage:
-```python
-from limbiq import SearchClient
-
-search = SearchClient(base_url="http://localhost:8888", provider="searxng")
-results = search("latest news on AI")
-for r in results:
-    print(f"{r.title}: {r.snippet}")
-```
+`llm_fn` is optional. Without it, Limbiq runs in heuristic mode — spaCy + regex extraction, no LLM-powered compression or tie-breaking.
 
 ## The Five Signals
 
+Signals fire automatically in `observe()` based on conversation content.
+
 ### Dopamine — "This matters, remember it"
 
-Fires when the user shares personal info, corrects the model, or gives positive feedback. Tagged memories are **always** included in context.
+Fires when the user shares personal info, corrections, or positive feedback. Tagged memories are **always** included in context.
 
 ```python
+# Automatic — fires when patterns like "my name is..." are detected
+# Manual:
 lq.dopamine("User's wife is named Prabhashi")
 ```
 
 ### GABA — "Suppress this, let it fade"
 
-Fires when memories are denied, contradicted, or go stale. Suppression is soft — memories can be restored.
+Fires on denials, contradictions, or stale data. Suppression is soft — memories can be restored.
 
 ```python
 lq.gaba(memory_id="abc123")
@@ -152,15 +83,14 @@ lq.restore_memory("abc123")  # Undo suppression
 Watches for recurring patterns across sessions. After 3+ observations across 2+ sessions, crystallizes into a permanent behavioral rule injected into every future context.
 
 ```python
-# Automatic — fires when patterns like "user always writes short messages" repeat
 rules = lq.get_active_rules()
-lq.deactivate_rule(rule_id)   # Turn off a wrong rule
-lq.reactivate_rule(rule_id)   # Turn it back on
+lq.deactivate_rule(rule_id)
+lq.reactivate_rule(rule_id)
 ```
 
 ### Acetylcholine — "Go deep here, build expertise"
 
-Detects sustained interest in a topic and creates knowledge clusters — grouped collections of memories loaded as a unit when the topic returns.
+Detects sustained interest in a topic (3+ turns) and creates knowledge clusters — grouped memories loaded as a unit when the topic returns.
 
 ```python
 clusters = lq.get_clusters()
@@ -169,44 +99,100 @@ memories = lq.get_cluster_memories(cluster_id)
 
 ### Norepinephrine — "Something changed, be careful"
 
-Fires on topic shifts, user frustration, or contradictions. Temporarily widens memory retrieval and adds caution flags. Effects reset after each `process()` call.
+Fires on topic shifts or frustration. Temporarily widens memory retrieval and adds caution flags. Effects reset after each `process()` call.
 
 ## Knowledge Graph
 
-Limbiq automatically builds a knowledge graph from conversations. Entities and relationships are extracted, inferred, and used to answer questions with zero LLM cost.
+Limbiq automatically builds a knowledge graph from conversations using a hybrid extraction pipeline:
+
+1. **spaCy dependency parsing** — possessive relations ("my wife Prabhashi"), copular patterns, chained predicates ("my wife's father")
+2. **LLM tie-break** — resolves ambiguous fragments when `llm_fn` is provided
+3. **Regex fallback** — 20+ patterns for common relationships
+4. **Fuzzy predicate matching** — catches typos (Levenshtein distance ≤ 1)
+
+The graph supports transitive inference (in-laws, grandparents, co-parents) and self-heals on every `observe()` call — cleaning junk entities, bridging disconnected components, and re-running inference.
 
 ```python
 lq.query_graph("Who is Prabhashi?")    # Direct graph lookup
-lq.get_world_summary()                  # Compact summary of everything known
+lq.get_world_summary()                  # Compact user profile from graph
 lq.get_entities()                        # All known entities
 lq.get_relations()                       # All relationships (including inferred)
+lq.describe_entity("Prabhashi")          # Natural language description
+lq.heal_graph()                          # Manual self-heal trigger
 ```
 
-## Activation Steering (Experimental)
+### Graph Pipeline (5 Phases)
 
-Beyond text injection, limbiq can modify the model's internal representations at inference time using learned direction vectors.
+For advanced use, Limbiq includes a multi-phase graph intelligence pipeline:
 
 ```python
-from limbiq import Limbiq
-from limbiq.steering import enable_steering
+# Phase 1: Rule-based propagation — suppress noise, merge duplicates, repair graph
+result = lq.propagate()
 
-lq = Limbiq(store_path="./data", user_id="test")
-steered = enable_steering(lq, model_path="mlx-community/Meta-Llama-3.1-8B-Instruct-4bit")
+# Phase 2: GNN propagation — Graph Attention Network learns activation scores
+#   3-layer GAT, 4 heads, 128-dim, ~2-5M params, trains on Phase 1 labels
+result = lq.propagate_gnn(train_first=True, epochs=200)
 
-# Signals now operate at the activation level
-result = steered.generate("What's my wife's name?")
-# Dopamine fires → memory_attention vector injected → model attends to memory
+# Phase 3: Pattern completion — TransE entity resolution + link prediction
+#   ~50K params, merges duplicate entities, predicts missing relations
+result = lq.run_pattern_completion(train_transe=True, epochs=500)
+
+# Phase 4: Activation retrieval — hybrid scoring
+#   final_score = α·embedding_sim + β·gnn_activation + γ·graph_relevance
+lq.enable_activation_retrieval()
+
+# Phase 5: Graph reasoning — micro-transformer for graph QA
+#   ~50K params, 3 modes: entity pointer, boolean, count
+lq.train_reasoner(epochs=100)
+answer = lq.reason("Who is Dimuthu's father-in-law?")
 ```
 
-8 steering dimensions: conciseness, formality, technical depth, creativity, confidence, helpfulness, honesty, memory attention.
+Phases 2-5 require PyTorch (`pip install torch`).
+
+## Vector Search
+
+Memory retrieval uses **FAISS** (Facebook AI Similarity Search) when available, falling back to numpy brute-force.
+
+- FAISS `IndexFlatIP` on normalized embeddings = exact cosine similarity
+- Incremental adds/removes — no full rebuild on each memory change
+- Index persisted to disk (`{user_id}.faiss`) between sessions
+- Thread-safe via `threading.Lock`
+
+```bash
+pip install faiss-cpu  # ~15MB, no GPU needed
+```
 
 ## Corrections
 
-Combines Dopamine + GABA — stores new info as priority, suppresses the old.
+Combines Dopamine + GABA — stores new info as priority, suppresses contradicting memories.
 
 ```python
 lq.correct("User works at Bitsmedia, not Google")
 ```
+
+## Playground
+
+Interactive web dashboard for exploring the knowledge graph, chatting, and inspecting signals.
+
+```bash
+pip install limbiq[playground]
+
+# Heuristic mode (no LLM needed)
+python -m limbiq.playground
+
+# With Ollama
+python -m limbiq.playground --llm-url http://localhost:11434/v1 --llm-model llama3.1
+
+# With OpenAI
+python -m limbiq.playground --llm-url https://api.openai.com/v1 --llm-model gpt-4o --llm-api-key sk-...
+```
+
+Open `http://localhost:8765` after starting. The dashboard includes:
+
+- **Chat** — talk to Limbiq and watch it learn in real time
+- **Knowledge Graph** — interactive D3 visualization of entities and relations
+- **Entity Explorer** — browse entities and their relationships
+- **Query Builder** — test graph queries and memory retrieval
 
 ## Inspection
 
@@ -217,91 +203,52 @@ lq.get_priority_memories()  # All dopamine-tagged memories
 lq.get_suppressed()         # All GABA-suppressed memories
 lq.get_full_profile()       # Complete user profile across all signals
 lq.export_state()           # Full JSON export for debugging
-```
-
-## Intent Classification & Smart Routing (v0.5)
-
-Limbiq can classify user intent and route queries intelligently — skipping the LLM entirely when the knowledge graph already has the answer.
-
-```python
-from limbiq import IntentClassifier, QueryRouter
-
-classifier = IntentClassifier()
-intent = classifier.classify("What's my wife's name?")
-# Intent(type='personal', confidence=0.9, is_question=True)
-
-router = QueryRouter()
-decision = router.route(intent, graph_result, world_summary="...")
-# If graph can answer → skip_llm=True, response from graph
-```
-
-### LLM Router (Swarm Architecture)
-
-Route different task types to different LLM agents based on capabilities and confidence:
-
-```python
-from limbiq import LLMRouter, TaskType, AgentCapability
-
-router = LLMRouter()
-router.register_agent("llama3", my_llama_fn, AgentCapability(
-    task_types=[TaskType.CHAT, TaskType.CREATIVE],
-    max_context_tokens=8192,
-))
-router.register_agent("gpt4o", my_gpt_fn, AgentCapability(
-    task_types=[TaskType.ANALYSIS, TaskType.CODE],
-    supports_tools=True,
-))
-
-lq = Limbiq(store_path="./data", user_id="dimuthu", llm_fn=router)
-```
-
-## Hallucination Detection (v0.4.3+)
-
-Pre- and post-generation fact checking against the knowledge graph and stored memories:
-
-```python
-detector = lq.get_hallucination_detector()
-
-# Before LLM generation — check what the graph knows
-grounding = detector.pre_generate(query, graph_result)
-
-# After LLM generation — verify claims against memory
-verification = detector.post_generate(response, user_name, query)
-
-if detector.should_regenerate(verification):
-    correction = detector.correction_prompt(verification, query)
-```
-
-## NLI Contradiction Detection (v0.5)
-
-Semantic contradiction detection using a cross-encoder model:
-
-```python
-from limbiq import NLIChecker
-
-nli = NLIChecker()
-result = nli.check("User's wife is Prabhashi", "Your wife is Sarah")
-# {"label": "contradiction", "score": 0.95}
+lq.get_graph_stats()        # Entity/relation counts
+lq.get_graph_connectivity() # Connected component analysis
 ```
 
 ## How It Works
 
-- **LLM-agnostic** — works with any LLM via a unified OpenAI-compatible client (Ollama, OpenAI, Claude, vLLM, LM Studio)
-- **Zero weight modification** — all adaptation through context manipulation and activation steering
-- **Knowledge graph** — entities and relations extracted automatically, inferred transitively
-- **Smart routing** — intent classification + query routing skips LLM when graph suffices
-- **Hallucination detection** — pre/post-generation fact checking with NLI contradiction detection
-- **Swarm architecture** — route tasks to the best agent based on capabilities and confidence
-- **Interactive playground** — web dashboard with chat, graph visualization, and trace viewer
-- **SQLite persistence** — memories, graph, and rules survive across sessions
-- **Semantic search** — sentence-transformers for embedding-based retrieval (TF-IDF fallback)
+- **LLM-agnostic** — works with any LLM via a callable, or runs without one in heuristic mode
+- **Zero weight modification** — all adaptation through context enrichment
+- **Knowledge graph** — entities and relations extracted automatically, inferred transitively, self-healed continuously
+- **FAISS vector search** — fast approximate nearest neighbor retrieval with numpy fallback
+- **5-phase graph pipeline** — GNN, TransE, and micro-transformer for deep graph intelligence (optional, requires PyTorch)
+- **SQLite persistence** — memories, graph, rules, and clusters survive across sessions
+- **Semantic search** — 384-dim sentence-transformer embeddings (all-MiniLM-L6-v2) with TF-IDF fallback
 - **Transparent** — every signal is logged with trigger, timestamp, and effect
-- **Reversible** — suppressed memories can be restored, rules deactivated, nothing permanently destructive
-- **Thread-safe** — per-thread SQLite connections with thread-safe embedding cache
+- **Reversible** — suppressed memories can be restored, rules deactivated
+- **Thread-safe** — per-thread SQLite connections, thread-safe FAISS index and embedding cache
 
 ## Architecture
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full system topology, data flow diagrams, dependency graph, and module reference.
+```
+┌──────────────────────────────────────────────────┐
+│              Limbiq Public API                     │
+├──────────────────────────────────────────────────┤
+│              LimbiqCore (orchestrator)             │
+│       process() → observe() → end_session()       │
+├─────────┬──────────┬──────────┬──────────────────┤
+│  Store  │ Signals  │  Graph   │ Retrieval+Context │
+│  Layer  │  Layer   │  Layer   │     Layer         │
+├─────────┴──────────┴──────────┴──────────────────┤
+│      Shared SQLite DB + FAISS Vector Index        │
+└──────────────────────────────────────────────────┘
+```
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full system topology, data flow diagrams, and module reference.
+
+## Development
+
+```bash
+git clone https://github.com/deBilla/limbiq.git
+cd limbiq
+pip install -e ".[dev]"
+python -m spacy download en_core_web_sm
+python -m pytest tests/ -x -q
+```
+
+CI runs tests on Python 3.10–3.13 via GitHub Actions. Releases are published to PyPI automatically when a GitHub Release is created.
 
 ## License
 
