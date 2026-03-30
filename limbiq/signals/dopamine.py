@@ -104,34 +104,58 @@ class DopamineSignal(BaseSignal):
             )
             return events
 
-        # ── Encoder-based detection ──
-        # The unified encoder classifies intent from sentence context.
-        # No hardcoded pattern fallback — if encoder isn't trained, signal doesn't fire.
+        # ── Encoder-based detection (preferred, high confidence only) ──
         if encoder and encoder.available:
             result = encoder.classify_intent(message)
             if result:
                 intent, conf = result
-                if intent == "correction" and conf > 0.5:
+                if intent == "correction" and conf > 0.7:
                     return [SignalEvent(
                         signal_type=SignalType.DOPAMINE,
                         trigger="user_correction",
                         details={"encoder_intent": intent, "confidence": conf,
                                  "message": message},
                     )]
-                if intent == "enthusiasm" and conf > 0.5:
+                if intent == "enthusiasm" and conf > 0.7:
                     return [SignalEvent(
                         signal_type=SignalType.DOPAMINE,
                         trigger="user_enthusiasm",
                         details={"encoder_intent": intent, "confidence": conf,
                                  "message": message},
                     )]
-                if intent == "personal_info" and conf > 0.5:
+                if intent == "personal_info" and conf > 0.7:
                     return [SignalEvent(
                         signal_type=SignalType.DOPAMINE,
                         trigger="novel_personal_info",
                         details={"encoder_intent": intent, "confidence": conf,
                                  "message": message},
                     )]
+            # Fall through to pattern matching if encoder wasn't confident
+
+        # ── Pattern fallback ──
+        for pattern in CORRECTION_PATTERNS:
+            if pattern in msg_lower:
+                return [SignalEvent(
+                    signal_type=SignalType.DOPAMINE,
+                    trigger="user_correction",
+                    details={"pattern": pattern, "message": message},
+                )]
+
+        for pattern in ENTHUSIASM_PATTERNS:
+            if pattern in msg_lower:
+                return [SignalEvent(
+                    signal_type=SignalType.DOPAMINE,
+                    trigger="user_enthusiasm",
+                    details={"pattern": pattern, "message": message},
+                )]
+
+        for pattern in PERSONAL_INFO_PATTERNS:
+            if pattern in msg_lower:
+                return [SignalEvent(
+                    signal_type=SignalType.DOPAMINE,
+                    trigger="novel_personal_info",
+                    details={"pattern": pattern, "message": message},
+                )]
 
         return events
 

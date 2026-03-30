@@ -85,7 +85,9 @@ class LimbiqCore:
         self._use_activation_retrieval = False  # Enabled after GNN training
 
         # Unified encoder — shared self-attention for all classification tasks
-        self.encoder = LimbiqEncoder(self.embeddings)
+        import os
+        encoder_dir = os.path.join(store_path, "encoder")
+        self.encoder = LimbiqEncoder(self.embeddings, model_dir=encoder_dir)
 
         # v0.1 signals (detect in observe loop)
         self.signals = [

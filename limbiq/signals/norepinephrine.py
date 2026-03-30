@@ -48,25 +48,43 @@ class NorepinephrineSignal(BaseSignal):
         events = []
         msg_lower = message.lower() if message else ""
 
-        # ── Encoder-based detection ──
+        # ── Encoder-based detection (preferred, high confidence only) ──
         if encoder and encoder.available:
             result = encoder.classify_intent(message)
             if result:
                 intent, conf = result
-                if intent == "frustration" and conf > 0.5:
+                if intent == "frustration" and conf > 0.7:
                     return [SignalEvent(
                         signal_type=SignalType.NOREPINEPHRINE,
                         trigger="user_frustration",
                         details={"encoder_intent": intent, "confidence": conf,
                                  "message": message[:200]},
                     )]
-                if intent == "contradiction" and conf > 0.5:
+                if intent == "contradiction" and conf > 0.7:
                     return [SignalEvent(
                         signal_type=SignalType.NOREPINEPHRINE,
                         trigger="potential_contradiction",
                         details={"encoder_intent": intent, "confidence": conf,
                                  "message": message[:200]},
                     )]
+            # Fall through to pattern matching if encoder wasn't confident
+
+        # ── Pattern fallback ──
+        for pattern in FRUSTRATION_PATTERNS:
+            if pattern in msg_lower:
+                return [SignalEvent(
+                    signal_type=SignalType.NOREPINEPHRINE,
+                    trigger="user_frustration",
+                    details={"pattern": pattern, "message": message[:200]},
+                )]
+
+        for pattern in CONTRADICTION_MARKERS:
+            if pattern in msg_lower:
+                return [SignalEvent(
+                    signal_type=SignalType.NOREPINEPHRINE,
+                    trigger="potential_contradiction",
+                    details={"pattern": pattern, "message": message[:200]},
+                )]
 
         return events
 

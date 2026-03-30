@@ -55,12 +55,12 @@ class GABASignal(BaseSignal):
             )
             return events
 
-        # ── Encoder-based detection ──
+        # ── Encoder-based detection (preferred, high confidence only) ──
         if encoder and encoder.available:
             result = encoder.classify_intent(message)
             if result:
                 intent, conf = result
-                if intent == "denial" and conf > 0.5:
+                if intent == "denial" and conf > 0.7:
                     memory_ids = []
                     if memories:
                         memory_ids = [m.id for m in memories if not m.is_priority]
@@ -71,6 +71,20 @@ class GABASignal(BaseSignal):
                                  "message": message},
                         memory_ids_affected=memory_ids,
                     )]
+            # Fall through to pattern matching if encoder wasn't confident
+
+        # ── Pattern fallback ──
+        for pattern in DENIAL_PATTERNS:
+            if pattern in msg_lower:
+                memory_ids = []
+                if memories:
+                    memory_ids = [m.id for m in memories if not m.is_priority]
+                return [SignalEvent(
+                    signal_type=SignalType.GABA,
+                    trigger="user_denial",
+                    details={"pattern": pattern, "message": message},
+                    memory_ids_affected=memory_ids,
+                )]
 
         return events
 

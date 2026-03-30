@@ -369,6 +369,14 @@ class LimbiqEncoder:
 
         self._try_load()
 
+        # Auto-bootstrap if no saved model was found
+        if not self._trained:
+            logger.info("No trained encoder found — running bootstrap training")
+            try:
+                self.train_bootstrap()
+            except Exception as e:
+                logger.warning(f"Bootstrap training failed: {e}")
+
     def _try_load(self):
         """Load saved model weights if available."""
         path = os.path.join(self.model_dir, "limbiq_encoder.pt")
