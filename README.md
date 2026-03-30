@@ -61,10 +61,10 @@ Signals fire automatically in `observe()` based on conversation content.
 
 ### Dopamine — "This matters, remember it"
 
-Fires when the user shares personal info, corrections, or positive feedback. Tagged memories are **always** included in context.
+Fires when the user shares personal info, corrections, or positive feedback. Tagged memories are **always** included in context. Detection uses the unified encoder (self-attention over sentence context) instead of keyword matching.
 
 ```python
-# Automatic — fires when patterns like "my name is..." are detected
+# Automatic — fires when the encoder detects personal info, corrections, or enthusiasm
 # Manual:
 lq.dopamine("User's wife is named Prabhashi")
 ```
@@ -100,6 +100,30 @@ memories = lq.get_cluster_memories(cluster_id)
 ### Norepinephrine — "Something changed, be careful"
 
 Fires on topic shifts or frustration. Temporarily widens memory retrieval and adds caution flags. Effects reset after each `process()` call.
+
+## Unified Encoder
+
+As of v0.5.2, signal detection is powered by a single self-attention encoder (`LimbiqEncoder`) that replaces 234+ hardcoded keyword patterns. The encoder classifies intent (correction, denial, enthusiasm, personal info, frustration, contradiction) from sentence context rather than keyword matching.
+
+- **Architecture**: token embeddings (384-dim) → project (64-dim) → 2-head self-attention + LayerNorm + FFN → task-specific heads
+- **Bootstrap**: trains on examples generated from the old keyword patterns
+- **Incremental learning**: retrains on user corrections as they happen
+- Requires PyTorch; falls back gracefully when unavailable
+
+## Entity State
+
+Entities in the knowledge graph now carry per-entity state inspired by biological cellular memory:
+
+- **Resting activation** — how "awake" an entity is based on recent mentions
+- **Receptor density** — per-signal sensitivity that adapts over time (entities that get corrected often become more sensitive to corrections)
+- **Signal history** — cumulative record of which signals have hit each entity
+- **Sentinel patterns** — immune-system-style watchers that flag stale references to corrected facts
+
+```python
+state = lq.get_entity_state(entity_id)   # Single entity state
+top = lq.get_top_activated_entities(5)    # Most active entities
+sentinels = lq.get_sentinels()            # Entities watching for stale facts
+```
 
 ## Knowledge Graph
 
@@ -197,24 +221,30 @@ Open `http://localhost:8765` after starting. The dashboard includes:
 ## Inspection
 
 ```python
-lq.get_stats()              # Memory counts per tier
-lq.get_signal_log()         # Full history of signals fired
-lq.get_priority_memories()  # All dopamine-tagged memories
-lq.get_suppressed()         # All GABA-suppressed memories
-lq.get_full_profile()       # Complete user profile across all signals
-lq.export_state()           # Full JSON export for debugging
-lq.get_graph_stats()        # Entity/relation counts
-lq.get_graph_connectivity() # Connected component analysis
+lq.get_stats()                        # Memory counts per tier
+lq.get_signal_log()                   # Full history of signals fired
+lq.get_priority_memories()            # All dopamine-tagged memories
+lq.get_suppressed()                   # All GABA-suppressed memories
+lq.get_full_profile()                 # Complete user profile across all signals
+lq.export_state()                     # Full JSON export for debugging
+lq.get_graph_stats()                  # Entity/relation counts
+lq.get_graph_connectivity()           # Connected component analysis
+lq.get_entity_state(entity_id)        # Per-entity activation + signal history
+lq.get_top_activated_entities(limit)  # Most active entities by activation
+lq.get_sentinels()                    # Entities with sentinel watchers
+lq.get_all_entity_states()            # Full entity state dump
 ```
 
 ## How It Works
 
 - **LLM-agnostic** — works with any LLM via a callable, or runs without one in heuristic mode
 - **Zero weight modification** — all adaptation through context enrichment
+- **Unified encoder** — single self-attention model classifies intent across all signals, replacing 234+ hardcoded patterns
+- **Entity state** — per-entity activation, receptor density, and signal history inspired by biological cellular memory
 - **Knowledge graph** — entities and relations extracted automatically, inferred transitively, self-healed continuously
 - **FAISS vector search** — fast approximate nearest neighbor retrieval with numpy fallback
 - **5-phase graph pipeline** — GNN, TransE, and micro-transformer for deep graph intelligence (optional, requires PyTorch)
-- **SQLite persistence** — memories, graph, rules, and clusters survive across sessions
+- **SQLite persistence** — memories, graph, rules, clusters, and entity states survive across sessions
 - **Semantic search** — 384-dim sentence-transformer embeddings (all-MiniLM-L6-v2) with TF-IDF fallback
 - **Transparent** — every signal is logged with trigger, timestamp, and effect
 - **Reversible** — suppressed memories can be restored, rules deactivated
@@ -223,17 +253,20 @@ lq.get_graph_connectivity() # Connected component analysis
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────┐
-│              Limbiq Public API                     │
-├──────────────────────────────────────────────────┤
-│              LimbiqCore (orchestrator)             │
-│       process() → observe() → end_session()       │
-├─────────┬──────────┬──────────┬──────────────────┤
-│  Store  │ Signals  │  Graph   │ Retrieval+Context │
-│  Layer  │  Layer   │  Layer   │     Layer         │
-├─────────┴──────────┴──────────┴──────────────────┤
-│      Shared SQLite DB + FAISS Vector Index        │
-└──────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│                 Limbiq Public API                      │
+├──────────────────────────────────────────────────────┤
+│                LimbiqCore (orchestrator)               │
+│         process() → observe() → end_session()         │
+├──────────┬──────────┬──────────┬─────────────────────┤
+│  Store   │ Signals  │  Graph   │ Retrieval + Context  │
+│  Layer   │  Layer   │  Layer   │       Layer          │
+├──────────┤          ├──────────┤                      │
+│          │ Unified  │  Entity  │                      │
+│          │ Encoder  │  State   │                      │
+├──────────┴──────────┴──────────┴─────────────────────┤
+│        Shared SQLite DB + FAISS Vector Index          │
+└──────────────────────────────────────────────────────┘
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full system topology, data flow diagrams, and module reference.
