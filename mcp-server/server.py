@@ -31,8 +31,9 @@ logging.basicConfig(
     filename=os.path.join(tempfile.gettempdir(), "limbiq_mcp.log"),
     level=logging.WARNING,
 )
-for _name in ["limbiq", "sentence_transformers", "transformers", "torch", "httpx"]:
+for _name in ["sentence_transformers", "transformers", "torch", "httpx"]:
     logging.getLogger(_name).setLevel(logging.ERROR)
+logging.getLogger("limbiq").setLevel(logging.DEBUG)
 
 from mcp.server.fastmcp import FastMCP
 from limbiq import Limbiq
@@ -114,11 +115,18 @@ def memory_query(question: str) -> str:
         question: Natural language question about the user
     """
     try:
+        graph_answer = lq.query_graph(question)
+        # get_world_summary can trigger DB writes (inference), wrap separately
+        try:
+            world_summary = lq.get_world_summary()
+        except Exception:
+            world_summary = ""
         return json.dumps({
-            "graph_answer": lq.query_graph(question),
-            "world_summary": lq.get_world_summary(),
+            "graph_answer": graph_answer,
+            "world_summary": world_summary,
         }, indent=2, default=str)
     except Exception as e:
+        logging.getLogger("limbiq").error(f"memory_query failed: {e}", exc_info=True)
         return json.dumps({"error": str(e)})
 
 

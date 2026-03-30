@@ -89,7 +89,7 @@ class MemoryStore:
         """Return a per-thread SQLite connection."""
         conn = getattr(self._local, 'conn', None)
         if conn is None:
-            conn = sqlite3.connect(self._db_path)
+            conn = sqlite3.connect(self._db_path, check_same_thread=False)
             self._local.conn = conn
         return conn
 
