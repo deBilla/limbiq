@@ -642,14 +642,39 @@ class EntityExtractor:
                         regex_result["entities"].append(entity)
                         extracted_names.add(enc_ent.name.lower())
 
-        # Add encoder-detected relations
+        # Add encoder-detected relations (supplementary to regex)
+        # Strategy: regex/spaCy results are trusted. Encoder only fills gaps.
+        # Build set of existing relation triples for dedup
+        existing_rels = set()
+        for ent in regex_result.get("entities", []):
+            for r in self.graph.get_relations_for(ent.id) if hasattr(ent, 'id') else []:
+                existing_rels.add((r.subject_id, r.predicate, r.object_id))
+
         for enc_rel in encoder_output.relations:
-            if enc_rel.confidence < 0.5:
+            if enc_rel.confidence < 0.6:  # Higher threshold for encoder (supplementary)
                 continue
+            if enc_rel.predicate == "none":
+                continue
+
             subj = self.graph.find_entity_by_name(enc_rel.subject.name)
             obj = self.graph.find_entity_by_name(enc_rel.object.name)
             if subj and obj:
-                from limbiq.graph.entities import VALID_PREDICATES
+                # Skip if regex already extracted a relation between these entities
+                has_existing = any(
+                    (s, p, o) for s, p, o in existing_rels
+                    if s == subj.id and o == obj.id
+                )
+                if has_existing:
+                    # Regex is trusted — don't override
+                    if enc_rel.predicate not in {r[1] for r in existing_rels
+                                                  if r[0] == subj.id and r[2] == obj.id}:
+                        logger.info(
+                            f"Encoder disagrees with regex: {enc_rel.subject.name}"
+                            f"→{enc_rel.predicate}→{enc_rel.object.name} "
+                            f"(keeping regex result)"
+                        )
+                    continue
+
                 if enc_rel.predicate in VALID_PREDICATES:
                     self.graph.add_relation(Relation(
                         subject_id=subj.id,

@@ -39,6 +39,7 @@ class GABASignal(BaseSignal):
         response: str = None,
         feedback: str = None,
         memories: list[Memory] = None,
+        encoder=None,
     ) -> list[SignalEvent]:
         events = []
         msg_lower = message.lower() if message else ""
@@ -54,25 +55,27 @@ class GABASignal(BaseSignal):
             )
             return events
 
-        # Check denial patterns
-        for pattern in DENIAL_PATTERNS:
-            if pattern in msg_lower:
-                memory_ids = []
-                if memories:
-                    memory_ids = [m.id for m in memories if not m.is_priority]
-                events.append(
-                    SignalEvent(
+        # ── Encoder-based detection ──
+        if encoder and encoder.available:
+            result = encoder.classify_intent(message)
+            if result:
+                intent, conf = result
+                if intent == "denial" and conf > 0.5:
+                    memory_ids = []
+                    if memories:
+                        memory_ids = [m.id for m in memories if not m.is_priority]
+                    return [SignalEvent(
                         signal_type=SignalType.GABA,
                         trigger="user_denial",
-                        details={"pattern": pattern, "message": message},
+                        details={"encoder_intent": intent, "confidence": conf,
+                                 "message": message},
                         memory_ids_affected=memory_ids,
-                    )
-                )
-                return events
+                    )]
 
         return events
 
-    def apply(self, event: SignalEvent, memory_store, embeddings=None) -> None:
+    def apply(self, event: SignalEvent, memory_store, embeddings=None,
+              graph_store=None) -> None:
         if event.trigger == "user_denial":
             for memory_id in event.memory_ids_affected:
                 memory_store.suppress(memory_id, SuppressionReason.USER_DENIED)

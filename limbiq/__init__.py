@@ -27,6 +27,7 @@ from limbiq.types import (
     RetrievalConfig,
 )
 from limbiq.graph.propagation import ActiveGraphPropagation, PropagationResult
+from limbiq.graph.entity_state import EntityState, EntityStateStore
 
 try:
     from limbiq.graph.gnn import GNNPropagation
@@ -135,6 +136,7 @@ class Limbiq:
             graph=self._core.graph,
             embedding_engine=self._core.embeddings,
             user_name=self._core.user_id,
+            entity_state_store=self._core.entity_state_store,
         )
         return prop.propagate()
 
@@ -196,6 +198,7 @@ class Limbiq:
             graph=self._core.graph,
             embedding_engine=self._core.embeddings,
             user_name=self._core.user_id,
+            entity_state_store=self._core.entity_state_store,
         )
         query_embedding = None
         if query:
@@ -284,6 +287,53 @@ class Limbiq:
     def get_world_summary(self) -> str:
         return self._core.inference_engine.get_user_world(self._core._graph_user_name)
 
+    # -- Unified Encoder --
+
+    def train_encoder_bootstrap(self, num_epochs: int = 50) -> dict:
+        """Bootstrap-train the unified encoder from hardcoded pattern data.
+
+        Converts the 234+ hardcoded patterns into training examples,
+        then trains the self-attention encoder to generalize beyond them.
+        For better results, use train_encoder_full() which downloads
+        real datasets from HuggingFace.
+        """
+        return self._core.encoder.train_bootstrap(num_epochs)
+
+    def train_encoder_full(self, max_per_class: int = 2000, epochs: int = 30) -> dict:
+        """Train the unified encoder on real datasets from HuggingFace.
+
+        Downloads GoEmotions, PersonaChat, CLINC150, dair-ai/emotion,
+        and generates synthetic correction examples. ~10K+ balanced
+        training examples across all 7 intent categories.
+
+        Requires: pip install datasets
+        """
+        from limbiq.encoder_training import download_and_train
+        return download_and_train(self._core.encoder, max_per_class, epochs)
+
+    @property
+    def encoder_available(self) -> bool:
+        """Whether the unified encoder is trained and ready."""
+        return self._core.encoder.available
+
+    # -- Entity State (distributed cellular memory) --
+
+    def get_entity_state(self, entity_id: str) -> "EntityState":
+        """Get the persistent state for a specific entity."""
+        return self._core.entity_state_store.get_state(entity_id)
+
+    def get_all_entity_states(self) -> list["EntityState"]:
+        """Get all entity states, ordered by resting activation."""
+        return self._core.entity_state_store.get_all_states()
+
+    def get_top_activated_entities(self, limit: int = 20) -> list["EntityState"]:
+        """Get entities with highest resting activation."""
+        return self._core.entity_state_store.get_top_activated(limit)
+
+    def get_sentinels(self) -> list["EntityState"]:
+        """Get all entities with active sentinel patterns."""
+        return self._core.entity_state_store.get_sentinels()
+
     # -- Inspection --
 
     def get_stats(self) -> dict:
@@ -342,6 +392,9 @@ __all__ = [
     "BehavioralRule",
     "KnowledgeCluster",
     "RetrievalConfig",
+    # Entity state (distributed cellular memory)
+    "EntityState",
+    "EntityStateStore",
     # Graph propagation
     "ActiveGraphPropagation",
     "PropagationResult",

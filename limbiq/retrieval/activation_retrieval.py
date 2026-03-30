@@ -34,8 +34,9 @@ class ScoredMemory:
     embedding_sim: float
     activation: float
     graph_boost: float
-    is_priority: bool
-    tier: str
+    resting_boost: float = 0.0  # Entity resting activation contribution
+    is_priority: bool = False
+    tier: str = ""
 
 
 class ActivationRetrieval:
@@ -45,17 +46,20 @@ class ActivationRetrieval:
     """
 
     def __init__(self, store, graph, embedding_engine,
-                 gnn_propagation=None, user_name: str = "Dimuthu"):
+                 gnn_propagation=None, user_name: str = "Dimuthu",
+                 entity_state_store=None):
         self.store = store
         self.graph = graph
         self.embeddings = embedding_engine
         self.gnn = gnn_propagation
         self.user_name = user_name
+        self.entity_state_store = entity_state_store
 
-        # Scoring weights
-        self.alpha = 0.45   # embedding similarity weight
-        self.beta = 0.35    # GNN activation weight
-        self.gamma = 0.20   # graph entity relevance weight
+        # Scoring weights — redistributed to include resting activation
+        self.alpha = 0.42   # embedding similarity weight
+        self.beta = 0.33    # GNN activation weight
+        self.gamma = 0.18   # graph entity relevance weight
+        self.delta = 0.07   # entity resting activation weight
 
     def search(self, query: str, query_embedding=None,
                top_k: int = 10, include_suppressed: bool = False) -> list[ScoredMemory]:
@@ -113,12 +117,16 @@ class ActivationRetrieval:
         # Step 3: Compute graph entity relevance
         graph_boost_map = self._compute_graph_boosts(query)
 
-        # Step 4: Blend scores
+        # Step 4: Compute resting activation boost from entity state
+        resting_map = self._compute_resting_boosts(query)
+
+        # Step 5: Blend scores
         scored = []
         for c in candidates:
             emb_score = c["embedding_sim"]
             act_score = activation_map.get(c["id"], 0.1)  # Default low activation
             graph_score = graph_boost_map.get(c["id"], 0.0)
+            resting_score = resting_map.get(c["id"], 0.0)
 
             # Priority memories get a floor activation
             if c["is_priority"] and act_score < 0.3:
@@ -130,7 +138,8 @@ class ActivationRetrieval:
             final = (
                 self.alpha * emb_score +
                 self.beta * act_score +
-                self.gamma * graph_score
+                self.gamma * graph_score +
+                self.delta * resting_score
             ) * conf_mult
 
             scored.append(ScoredMemory(
@@ -140,6 +149,7 @@ class ActivationRetrieval:
                 embedding_sim=emb_score,
                 activation=act_score,
                 graph_boost=graph_score,
+                resting_boost=resting_score,
                 is_priority=c["is_priority"],
                 tier=c["tier"],
             ))
@@ -198,6 +208,65 @@ class ActivationRetrieval:
             if direct > 0:
                 # Scale: 1 mention = 0.5, 2+ = 0.8, capped at 1.0
                 boosts[mid] = min(1.0, 0.3 + direct * 0.25)
+
+        return boosts
+
+    def _compute_resting_boosts(self, query: str) -> dict:
+        """
+        Boost memories connected to entities with high resting activation.
+
+        Entities that have been frequently discussed (high resting activation)
+        make their associated memories more likely to surface — like how
+        frequently-used neural pathways have lower firing thresholds.
+        """
+        boosts = {}
+        if not self.entity_state_store:
+            return boosts
+
+        try:
+            # Get entities with meaningful resting activation
+            top_states = self.entity_state_store.get_top_activated(limit=30)
+            if not top_states:
+                return boosts
+
+            # Build entity_id → resting_activation map
+            activation_by_id = {
+                s.entity_id: s.resting_activation
+                for s in top_states if s.resting_activation > 0.01
+            }
+            if not activation_by_id:
+                return boosts
+
+            # Build entity_id → name map
+            entities = self.graph.get_all_entities()
+            name_by_id = {e.id: e.name.lower() for e in entities}
+
+            # Collect names of activated entities
+            activated_names = {
+                name_by_id[eid]: act
+                for eid, act in activation_by_id.items()
+                if eid in name_by_id and len(name_by_id[eid]) > 1
+            }
+            if not activated_names:
+                return boosts
+
+            # Scan memories for mentions of activated entities
+            rows = self.store.db.execute(
+                "SELECT id, content FROM memories WHERE is_suppressed = 0"
+            ).fetchall()
+
+            for mid, content in rows:
+                content_lower = content.lower()
+                max_activation = 0.0
+                for name, act in activated_names.items():
+                    if name in content_lower:
+                        max_activation = max(max_activation, act)
+                if max_activation > 0:
+                    # Normalize to [0, 1] range — resting activation max is 2.0
+                    boosts[mid] = min(1.0, max_activation / 1.0)
+
+        except Exception as e:
+            logger.warning(f"Resting boost computation failed: {e}")
 
         return boosts
 

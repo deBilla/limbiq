@@ -33,6 +33,8 @@ from limbiq.signals.serotonin import SerotoninSignal
 from limbiq.signals.acetylcholine import AcetylcholineSignal
 from limbiq.signals.norepinephrine import NorepinephrineSignal
 from limbiq.graph.store import GraphStore
+from limbiq.graph.entity_state import EntityStateStore
+from limbiq.encoder import LimbiqEncoder
 from limbiq.graph.entities import EntityExtractor
 from limbiq.graph.inference import InferenceEngine
 from limbiq.graph.query import GraphQuery
@@ -58,8 +60,11 @@ class LimbiqCore:
         self.rule_store = RuleStore(self.store)
         self.cluster_store = ClusterStore(self.store)
 
+        # Distributed entity state (cellular memory)
+        self.entity_state_store = EntityStateStore(self.store)
+
         # Knowledge graph — shares the same SQLite DB
-        self.graph = GraphStore(self.store)
+        self.graph = GraphStore(self.store, entity_state_store=self.entity_state_store)
         self.entity_extractor = EntityExtractor(
             self.graph, user_id, llm_fn,
             embedding_engine=self.embeddings,
@@ -78,6 +83,9 @@ class LimbiqCore:
             self.graph, self.inference_engine
         )
         self._use_activation_retrieval = False  # Enabled after GNN training
+
+        # Unified encoder — shared self-attention for all classification tasks
+        self.encoder = LimbiqEncoder(self.embeddings)
 
         # v0.1 signals (detect in observe loop)
         self.signals = [
@@ -99,6 +107,9 @@ class LimbiqCore:
         # Embedding cache: avoids re-embedding the same message in observe()
         self._cached_query_text: str | None = None
         self._cached_query_embedding = None
+
+        # Correction-triggered retraining timestamp
+        self._last_retrain_at: float = 0.0
 
     def process(self, message: str, conversation_history: list[dict] = None) -> ProcessResult:
         query_embedding = self.embeddings.embed(message)
@@ -142,6 +153,24 @@ class LimbiqCore:
         )
         for event in ne_events:
             self.signal_log.log(event)
+
+        # ── Sentinel check: immune-style pattern matching ──
+        # If the query mentions an entity that has a sentinel (from a past
+        # correction), add a caution flag so the LLM knows this area has
+        # outdated information that was previously corrected.
+        sentinel_warnings = self._check_sentinels(message)
+        if sentinel_warnings:
+            existing_caution = self._retrieval_config.caution_flag or ""
+            sentinel_msg = "; ".join(sentinel_warnings)
+            if existing_caution:
+                self._retrieval_config.caution_flag = f"{existing_caution}; {sentinel_msg}"
+            else:
+                self._retrieval_config.add_caution(sentinel_msg)
+
+        # ── Expression masks: topic-sensitive entity property filtering ──
+        # Like DNA methylation — which aspects of an entity are "expressed"
+        # depends on the current conversation context.
+        self._update_expression_masks(message)
 
         # Retrieve with current config (possibly widened by norepinephrine)
         scored_memories = None
@@ -235,9 +264,11 @@ class LimbiqCore:
                 response=response,
                 feedback=feedback,
                 memories=existing_memories,
+                encoder=self.encoder,
             )
             for event in detected:
-                signal.apply(event, self.store, self.embeddings)
+                signal.apply(event, self.store, self.embeddings,
+                             graph_store=self.graph)
                 self.signal_log.log(event)
                 events.append(event)
 
@@ -253,6 +284,10 @@ class LimbiqCore:
             for e in events
         )
 
+        # Skip entity extraction when correction/denial fired — extracting
+        # from "Smurphy is a wrong name" creates junk entities like "wrong", "name".
+        _skip_extraction = _is_correction
+
         # Run serotonin, acetylcholine, and entity extraction in parallel
         with ThreadPoolExecutor(max_workers=4) as pool:
             sero_future = pool.submit(
@@ -265,22 +300,25 @@ class LimbiqCore:
                 message, response, self._conversation_buffer,
                 self.cluster_store, self.store, self.embeddings, self.llm_fn,
             )
-            ent_msg_future = pool.submit(
-                self.entity_extractor.extract_from_memory, message
-            )
-            # Also extract from LLM response — it often confirms/clarifies
-            # relationships ("your father-in-law Chandrasiri"). In response_mode,
-            # only relations between existing graph entities are kept —
-            # no new entities from response filler.
-            ent_resp_future = pool.submit(
-                self.entity_extractor.extract_from_memory,
-                response, "", True,  # response_mode=True
-            )
+
+            if not _skip_extraction:
+                ent_msg_future = pool.submit(
+                    self.entity_extractor.extract_from_memory, message
+                )
+                ent_resp_future = pool.submit(
+                    self.entity_extractor.extract_from_memory,
+                    response, "", True,
+                )
+            else:
+                ent_msg_future = None
+                ent_resp_future = None
 
             serotonin_events = sero_future.result()
             ach_events = ach_future.result()
-            ent_msg_future.result()
-            ent_resp_future.result()
+            if ent_msg_future:
+                ent_msg_future.result()
+            if ent_resp_future:
+                ent_resp_future.result()
 
         # Graph correction AFTER extraction
         if _is_correction:
@@ -294,6 +332,11 @@ class LimbiqCore:
         self.inference_engine.run_full_inference()
         self._heal_graph_connectivity()
         self.graph_query.mark_dirty()
+
+        # ── Distributed entity state: activate + flood signals ──
+        # Runs AFTER entity extraction so newly extracted entities receive signals.
+        # Like neurotransmitters flooding the synaptic space after signal detection.
+        self._update_entity_states(message, events)
 
         # Log signal events
         for event in serotonin_events:
@@ -316,6 +359,16 @@ class LimbiqCore:
                 metadata={},
                 embedding=embedding,
             )
+
+        # ── Correction-triggered learning ──
+        # Any correction/denial signal means the user is teaching us.
+        # Store as training data and retrain the unified encoder.
+        _correction_events = [
+            e for e in events
+            if e.trigger in ("user_correction", "user_denial", "contradicted")
+        ]
+        if _correction_events:
+            self._learn_from_correction(message, _correction_events)
 
         # Clear embedding cache
         self._cached_query_text = None
@@ -368,6 +421,15 @@ class LimbiqCore:
             logger.warning(f"Entity resolution failed in end_session: {e}")
 
         self.store.age_all()
+
+        # Decay entity resting activations (like ion channels resetting)
+        decayed = self.entity_state_store.decay_activations(decay_factor=0.95)
+        results["entities_decayed"] = decayed
+
+        # Cleanup orphaned entity states
+        orphaned = self.entity_state_store.cleanup_orphaned()
+        if orphaned:
+            logger.info(f"Cleaned up {orphaned} orphaned entity states")
 
         stale = self.store.get_stale(min_sessions=10)
         for m in stale:
@@ -570,100 +632,73 @@ class LimbiqCore:
         return False
 
     def _correct_graph(self, message: str):
+        """Correct the graph based on a correction/denial message.
+
+        Simple approach: find entities mentioned in the message, then
+        decide what to do based on a small set of action keywords.
+        No regex pattern matching — just entity lookup + keywords.
         """
-        When a correction/denial is detected:
-        1. DELETE wrong relations from the graph
-        2. UPDATE entity types if the correction implies a type change
-        3. RE-EXTRACT from the correction message to create correct relations
-        4. Re-run inference to rebuild dependent chains
-        """
+        msg_lower = message.lower()
+        all_entities = self.graph.get_all_entities()
         deleted_something = False
 
-        # Strategy 1: Find denied PREDICATES and remove matching relations
-        denied_pred_patterns = [
-            r"not\s+(?:a\s+|an\s+|my\s+)?(\w+)",
-            r"(?:isn't|isnt)\s+(?:a\s+|an\s+|my\s+)?(\w+)",
+        # Find entities mentioned in the message
+        mentioned = [
+            e for e in all_entities
+            if len(e.name) > 1 and e.name.lower() in msg_lower
         ]
-        for pattern in denied_pred_patterns:
-            match = re.search(pattern, message, re.I)
-            if match:
-                denied_word = match.group(1).lower()
-                from limbiq.graph.entities import _normalize_predicate, VALID_PREDICATES
-                normalized = _normalize_predicate(denied_word)
-                if normalized in VALID_PREDICATES:
-                    words = message.split()
-                    entity_names = [w.strip(".,!?'\"") for w in words
-                                    if w[0:1].isupper() and len(w) > 2]
-                    for name in entity_names:
-                        ent = self.graph.find_entity_by_name(name)
-                        if ent:
-                            try:
-                                self.graph.db.execute(
-                                    "DELETE FROM relations WHERE object_id=? AND predicate=?",
-                                    (ent.id, normalized),
-                                )
-                                self.graph.db.commit()
-                                deleted_something = True
-                                logger.info(f"Deleted denied predicate '{normalized}' → {name}")
-                            except Exception as e:
-                                logger.warning(f"Failed to delete denied predicate: {e}")
-                    if deleted_something:
-                        break
 
-        # Strategy 2: "X is not Y"
-        if not deleted_something:
-            denial_patterns = [
-                r"(\w+)\s+is\s+not\s+(?:my\s+)?(\w+)",
-                r"not\s+(\w+)(?:'s|s)\s+(\w+)",
-                r"(\w+)\s+(?:isn't|isnt)\s+(?:my\s+)?(\w+)",
-            ]
-            for pattern in denial_patterns:
-                match = re.search(pattern, message, re.I)
-                if match:
-                    name_a = match.group(1)
-                    name_b = match.group(2)
-                    self.graph.delete_relations_between(name_a, name_b)
-                    deleted_something = True
-                    break
+        if not mentioned:
+            return
 
-        # Strategy 3: Fallback — extract capitalized names and delete between them
-        if not deleted_something:
-            words = message.split()
-            names = [w.strip(".,!?'\"") for w in words if w[0:1].isupper() and len(w) > 2]
-            found_entities = []
-            for name in names:
-                ent = self.graph.find_entity_by_name(name)
-                if ent:
-                    found_entities.append(ent)
+        # Action keywords — what does the user want to do?
+        DELETE_KEYWORDS = {"wrong", "incorrect", "mistake", "fake", "remove",
+                           "delete", "forget", "fabricated", "made up", "not real"}
+        NEGATE_KEYWORDS = {"isn't", "isnt", "is not", "not", "doesn't", "doesnt",
+                           "does not", "never", "no longer", "wasn't", "wasnt"}
 
-            if len(found_entities) >= 2:
-                self.graph.delete_relations_between(
-                    found_entities[0].name, found_entities[1].name
+        wants_delete = any(kw in msg_lower for kw in DELETE_KEYWORDS)
+        wants_negate = any(kw in msg_lower for kw in NEGATE_KEYWORDS)
+
+        if wants_delete and len(mentioned) == 1:
+            # "Smurphy is wrong" — delete the entity entirely
+            ent = mentioned[0]
+            self.graph._delete_entity_and_relations(ent.id)
+            self.graph.db.commit()
+            # Suppress related memories
+            rows = self.store.db.execute(
+                "SELECT id FROM memories WHERE is_suppressed = 0 "
+                "AND content LIKE ? LIMIT 10",
+                (f"%{ent.name}%",),
+            ).fetchall()
+            for (mid,) in rows:
+                self.store.suppress(mid, SuppressionReason.CONTRADICTED)
+            # Clean entity state
+            try:
+                self.entity_state_store.db.execute(
+                    "DELETE FROM entity_state WHERE entity_id = ?", (ent.id,),
                 )
-                deleted_something = True
+                self.entity_state_store.db.commit()
+            except Exception:
+                pass
+            deleted_something = True
+            logger.info(f"Deleted entity '{ent.name}' and all relations")
 
-        # Update entity types from correction context
-        type_patterns = [
-            (r"(\w+)\s+is\s+(?:a|an)\s+(dog|cat|animal|pet)", "animal"),
-            (r"(\w+)\s+is\s+(?:a|an)\s+(person|human|man|woman|boy|girl)", "person"),
-            (r"(\w+)\s+is\s+(?:a|an)\s+(place|city|country|town|village)", "place"),
-            (r"(\w+)\s+is\s+(?:a|an)\s+(company|organization|org|firm)", "company"),
-        ]
-        for pattern, etype in type_patterns:
-            match = re.search(pattern, message, re.I)
-            if match:
-                name = match.group(1).strip()
-                ent = self.graph.find_entity_by_name(name)
-                if ent and ent.entity_type != etype:
-                    try:
-                        self.graph.db.execute(
-                            "UPDATE entities SET entity_type=? WHERE id=?",
-                            (etype, ent.id),
-                        )
-                        self.graph.db.commit()
-                        logger.info(f"Updated entity type: {name} → {etype}")
-                    except Exception as e:
-                        logger.warning(f"Failed to update entity type for {name}: {e}")
+        elif wants_negate and len(mentioned) >= 2:
+            # "Smurphy isnt Yuenshe's dog" — delete relations between them
+            for i, a in enumerate(mentioned):
+                for b in mentioned[i + 1:]:
+                    self.graph.delete_relations_between(a.name, b.name)
+                    deleted_something = True
+                    logger.info(f"Deleted relations between '{a.name}' and '{b.name}'")
+
+        elif wants_negate and len(mentioned) == 1:
+            # "Smurphy is not a real name" — delete entity
+            ent = mentioned[0]
+            self.graph._delete_entity_and_relations(ent.id)
+            self.graph.db.commit()
+            deleted_something = True
+            logger.info(f"Deleted negated entity '{ent.name}'")
 
         # Clear inferred relations so they rebuild from correct data
         if deleted_something:
@@ -720,6 +755,7 @@ class LimbiqCore:
                     embedding_engine=self.embeddings,
                     gnn_propagation=gnn,
                     user_name=self._graph_user_name,
+                    entity_state_store=self.entity_state_store,
                 )
                 self._use_activation_retrieval = True
                 return True
@@ -741,6 +777,366 @@ class LimbiqCore:
             if row:
                 memories.append(self.store._row_to_memory(row))
         return memories
+
+    def _update_entity_states(self, message: str, events: list[SignalEvent]):
+        """Update per-entity state after signal detection.
+
+        Biological model: neurotransmitters don't target specific neurons —
+        they flood the synaptic space. Nearby receptors absorb the signal.
+
+        1. Activate entities mentioned in the message (resting potential increases)
+        2. For each signal event, flood ALL entities mentioned in the affected
+           memory's text content — not just entities whose source_memory_id matches.
+        3. Modulate activation by each entity's receptor density.
+        4. On corrections/denials, create sentinel patterns on suppressed entities
+           (immune T-cell memory — watches for stale references).
+        """
+        try:
+            all_entities = self.graph.get_all_entities()
+            if not all_entities:
+                return
+
+            # Find entities mentioned in the message
+            msg_lower = message.lower()
+            mentioned = [
+                e for e in all_entities
+                if len(e.name) > 1 and e.name.lower() in msg_lower
+            ]
+
+            # Activate mentioned entities
+            for entity in mentioned:
+                self.entity_state_store.activate(entity.id, delta=0.1)
+
+            # Flood signals to entities in the neighborhood.
+            # "Neighborhood" = entities mentioned in the message OR in affected memories.
+            for event in events:
+                # Strategy 1: Signal floods entities mentioned in the current message.
+                # This is the primary pathway — the message IS the synaptic space.
+                for entity in mentioned:
+                    state = self.entity_state_store.get_state(entity.id)
+                    receptor = state.receptor_density.get(
+                        event.signal_type.value, 1.0
+                    )
+                    self.entity_state_store.activate(
+                        entity.id, delta=0.05 * receptor
+                    )
+                    self.entity_state_store.record_signal(
+                        entity.id, event.signal_type.value
+                    )
+
+                # Strategy 2: Also flood entities mentioned in affected memory content.
+                # This catches entities that were stored earlier but relate to this signal.
+                if event.memory_ids_affected:
+                    for mem_id in event.memory_ids_affected:
+                        try:
+                            row = self.store.db.execute(
+                                "SELECT content FROM memories WHERE id = ?",
+                                (mem_id,),
+                            ).fetchone()
+                            if not row:
+                                continue
+                            mem_lower = row[0].lower()
+                            for entity in all_entities:
+                                if entity.id in {e.id for e in mentioned}:
+                                    continue  # Already flooded via strategy 1
+                                if len(entity.name) > 1 and entity.name.lower() in mem_lower:
+                                    state = self.entity_state_store.get_state(entity.id)
+                                    receptor = state.receptor_density.get(
+                                        event.signal_type.value, 1.0
+                                    )
+                                    self.entity_state_store.activate(
+                                        entity.id, delta=0.03 * receptor
+                                    )
+                                    self.entity_state_store.record_signal(
+                                        entity.id, event.signal_type.value
+                                    )
+                        except Exception:
+                            pass  # Memory may have been deleted
+
+                # ── Sentinel creation on corrections/denials ──
+                # Like immune T-cells: when a fact is corrected, create a sentinel
+                # that watches for stale references to the OLD fact.
+                if event.trigger in ("user_correction", "user_denial", "contradicted"):
+                    self._create_sentinels_from_correction(event, all_entities)
+
+        except Exception as e:
+            logger.warning(f"Entity state update failed: {e}")
+
+    def _learn_from_correction(self, message: str, events: list[SignalEvent]):
+        """Learn from user corrections — store training pair + retrain encoder.
+
+        Every correction/denial is a learning opportunity:
+        1. Store the message + detected intent as a training pair
+        2. If enough corrections accumulated, retrain the unified encoder
+        """
+        try:
+            import time
+
+            # Determine what intent this correction represents
+            for event in events:
+                if event.trigger == "user_correction":
+                    intent_label = "correction"
+                elif event.trigger == "user_denial":
+                    intent_label = "denial"
+                else:
+                    intent_label = "correction"
+
+                # Store as training pair for the unified encoder
+                self.graph.store_relation_correction(
+                    sentence=message,
+                    subject_name=intent_label,  # Reusing field for intent label
+                    predicate="intent",          # Marks this as intent training data
+                    object_name=event.trigger,
+                    is_positive=True,
+                )
+
+            # Check if enough corrections to retrain
+            new_corrections = self.graph.count_corrections_since(self._last_retrain_at)
+            if new_corrections < 3:
+                return
+
+            self._last_retrain_at = time.time()
+
+            def _retrain():
+                try:
+                    # Collect intent corrections
+                    corrections = self.graph.get_relation_corrections()
+                    intent_pairs = [
+                        (c["sentence"], c["subject_name"])
+                        for c in corrections
+                        if c["predicate"] == "intent" and c["is_positive"]
+                    ]
+
+                    if intent_pairs and self.encoder.available:
+                        result = self.encoder.incremental_train(
+                            intent_pairs, num_epochs=20
+                        )
+                        logger.info(f"Unified encoder retrained: {result}")
+
+                    # Also retrain relation classifier if available
+                    graph_encoder = self.entity_extractor._encoder
+                    if graph_encoder is not None:
+                        result = graph_encoder.incremental_train(
+                            self.graph, num_epochs=20
+                        )
+                        logger.info(f"Relation classifier retrained: {result}")
+
+                except Exception as e:
+                    logger.warning(f"Incremental retraining failed: {e}")
+
+            # Background thread to avoid blocking observe()
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pool.submit(_retrain)
+
+        except Exception as e:
+            logger.warning(f"Learn from correction failed: {e}")
+
+    def _update_expression_masks(self, message: str):
+        """Update expression masks based on current query topic.
+
+        Like DNA methylation — the same entity has different aspects
+        "expressed" depending on context. In a work conversation,
+        work-related properties are active; in personal conversation,
+        personal properties are active.
+
+        Topic detection categories:
+        - work: employment, projects, technical, meetings
+        - personal: family, hobbies, feelings, social
+        - location: travel, places, addresses
+        """
+        try:
+            msg_lower = message.lower()
+
+            # Simple topic detection via keyword presence
+            work_keywords = {
+                "work", "job", "office", "project", "meeting", "code",
+                "deploy", "build", "architecture", "design", "sprint",
+                "team", "manager", "deadline", "review", "merge",
+                "production", "bug", "feature", "release", "standup",
+            }
+            personal_keywords = {
+                "family", "wife", "husband", "father", "mother", "kid",
+                "birthday", "dinner", "cook", "hobby", "paint", "music",
+                "friend", "weekend", "vacation", "movie", "game", "fun",
+                "love", "miss", "feel", "happy", "sad",
+            }
+
+            words = set(msg_lower.split())
+            work_score = len(words & work_keywords)
+            personal_score = len(words & personal_keywords)
+
+            # Only update masks if there's a clear signal
+            if work_score == 0 and personal_score == 0:
+                return
+
+            is_work = work_score > personal_score
+            is_personal = personal_score > work_score
+
+            # Update masks on entities mentioned in the message
+            all_entities = self.graph.get_all_entities()
+            for entity in all_entities:
+                if len(entity.name) <= 1:
+                    continue
+                if entity.name.lower() not in msg_lower:
+                    continue
+
+                mask = {
+                    "work": is_work,
+                    "personal": is_personal,
+                }
+                self.entity_state_store.update_expression_mask(entity.id, mask)
+
+        except Exception as e:
+            logger.warning(f"Expression mask update failed: {e}")
+
+    def _check_sentinels(self, message: str) -> list[str]:
+        """Check if the message triggers any sentinel patterns.
+
+        Like immune surveillance: sentinel entities watch for specific patterns
+        and raise an alarm when detected. Returns a list of warning messages.
+        """
+        warnings = []
+        try:
+            sentinels = self.entity_state_store.get_sentinels()
+            if not sentinels:
+                return warnings
+
+            msg_lower = message.lower()
+            for sentinel in sentinels:
+                if sentinel.sentinel_pattern and sentinel.sentinel_pattern in msg_lower:
+                    # Find the entity name for a human-readable warning
+                    entity = self.graph.find_entity_by_name(sentinel.sentinel_pattern)
+                    entity_name = entity.name if entity else sentinel.sentinel_pattern
+                    warnings.append(
+                        f"Previously corrected info about '{entity_name}' — "
+                        f"verify before referencing"
+                    )
+                    # Activate the sentinel entity (it did its job)
+                    self.entity_state_store.activate(sentinel.entity_id, delta=0.05)
+                    logger.info(f"Sentinel triggered: '{sentinel.sentinel_pattern}' in query")
+        except Exception as e:
+            logger.warning(f"Sentinel check failed: {e}")
+        return warnings
+
+    def _create_sentinels_from_correction(
+        self, event: SignalEvent, all_entities: list
+    ):
+        """Create sentinel patterns from a correction/denial event.
+
+        When a user says "No that's wrong, I don't live in London, I moved
+        to Boston", find entities that are being NEGATED in the correction
+        message and set sentinels on them.
+
+        Strategy: parse the correction message for negation patterns
+        ("don't live in X", "not at X", "no longer at X") and sentinel
+        the entities found in the negated clause. These entities represent
+        stale facts that should be flagged if referenced later.
+        """
+        try:
+            msg = event.details.get("message", "")
+            if not msg:
+                return
+            msg_lower = msg.lower()
+
+            # Extract entities that appear in negation context within the message.
+            # Patterns: "don't/doesn't/didn't [verb] [in/at] ENTITY"
+            #           "not [at/in/from] ENTITY"
+            #           "no longer [at/in] ENTITY"
+            #           "moved from ENTITY"
+            import re
+            negation_patterns = [
+                r"(?:don'?t|doesn'?t|didn'?t|not|no longer|never)\s+\w+\s+(?:in|at|from|to)\s+",
+                r"moved\s+(?:from|away\s+from)\s+",
+                r"left\s+",
+                r"(?:don'?t|doesn'?t)\s+(?:live|work|stay)\s+",
+            ]
+
+            # Find entities in the negation zone vs the rest of the message.
+            # Split on clause boundaries (comma, period, semicolon) to avoid
+            # matching entities in adjacent clauses.
+            negated_ids = set()
+            affirmed_ids = set()
+            entity_by_id = {e.id: e for e in all_entities}
+
+            for entity in all_entities:
+                if len(entity.name) <= 1:
+                    continue
+                name_lower = entity.name.lower()
+                if name_lower not in msg_lower:
+                    continue
+
+                # Check if this entity appears right after a negation pattern,
+                # within the SAME clause (stop at comma/period/semicolon).
+                is_negated = False
+                for neg_pat in negation_patterns:
+                    for match in re.finditer(neg_pat, msg_lower):
+                        neg_end = match.end()
+                        # Find next clause boundary
+                        rest = msg_lower[neg_end:]
+                        clause_end = len(rest)
+                        for sep in (",", ".", ";", " but ", " and "):
+                            idx = rest.find(sep)
+                            if idx != -1 and idx < clause_end:
+                                clause_end = idx
+                        search_zone = rest[:clause_end]
+                        if name_lower in search_zone:
+                            is_negated = True
+                            break
+                    if is_negated:
+                        break
+
+                if is_negated:
+                    negated_ids.add(entity.id)
+                else:
+                    affirmed_ids.add(entity.id)
+
+            # Create sentinels on negated entities (the stale facts)
+            for eid in negated_ids:
+                entity = entity_by_id[eid]
+                # Don't sentinel entities that are also affirmed in the same message
+                if eid in affirmed_ids:
+                    continue
+
+                existing_state = self.entity_state_store.get_state(entity.id)
+                if existing_state.sentinel_pattern:
+                    continue  # Already watching
+
+                pattern = entity.name.lower()
+                self.entity_state_store.set_sentinel(entity.id, pattern)
+                logger.info(
+                    f"Sentinel created: watching for '{entity.name}' "
+                    f"(negated in correction)"
+                )
+
+            # Also check suppressed memories for additional sentinel targets
+            if event.memory_ids_affected:
+                for mem_id in event.memory_ids_affected:
+                    row = self.store.db.execute(
+                        "SELECT content, is_suppressed FROM memories WHERE id = ?",
+                        (mem_id,),
+                    ).fetchone()
+                    if not row or not row[1]:
+                        continue  # Only suppressed memories
+                    content_lower = row[0].lower()
+                    for entity in all_entities:
+                        if len(entity.name) <= 1:
+                            continue
+                        if entity.name.lower() in content_lower:
+                            if entity.id in affirmed_ids or entity.id in negated_ids:
+                                continue
+                            existing_state = self.entity_state_store.get_state(entity.id)
+                            if existing_state.sentinel_pattern:
+                                continue
+                            pattern = entity.name.lower()
+                            self.entity_state_store.set_sentinel(entity.id, pattern)
+                            logger.info(
+                                f"Sentinel created: watching for '{entity.name}' "
+                                f"(from suppressed memory)"
+                            )
+
+        except Exception as e:
+            logger.warning(f"Sentinel creation failed: {e}")
 
     def start_session(self):
         if self._conversation_buffer:

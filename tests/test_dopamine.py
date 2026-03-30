@@ -1,9 +1,18 @@
 from limbiq.signals.dopamine import DopamineSignal
+from tests.conftest import MockEncoder
 
 
 class TestDopamineDetection:
     def setup_method(self):
         self.signal = DopamineSignal()
+        self.encoder = MockEncoder({
+            "wrong": ("correction", 0.9),
+            "not": ("correction", 0.85),
+            "exactly": ("enthusiasm", 0.9),
+            "perfect": ("enthusiasm", 0.9),
+            "my wife": ("personal_info", 0.9),
+            "my name": ("personal_info", 0.9),
+        })
 
     def test_detects_correction(self):
         events = self.signal.detect(
@@ -11,6 +20,7 @@ class TestDopamineDetection:
             response=None,
             feedback=None,
             memories=[],
+            encoder=self.encoder,
         )
         assert len(events) > 0
         assert events[0].trigger == "user_correction"
@@ -21,6 +31,7 @@ class TestDopamineDetection:
             response=None,
             feedback=None,
             memories=[],
+            encoder=self.encoder,
         )
         assert len(events) > 0
         assert events[0].trigger == "user_enthusiasm"
@@ -31,6 +42,7 @@ class TestDopamineDetection:
             response=None,
             feedback=None,
             memories=[],
+            encoder=self.encoder,
         )
         assert len(events) > 0
         assert events[0].trigger == "novel_personal_info"
@@ -61,5 +73,6 @@ class TestDopamineDetection:
             response=None,
             feedback=None,
             memories=[],
+            encoder=self.encoder,
         )
         assert len(events) == 0

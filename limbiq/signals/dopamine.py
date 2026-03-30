@@ -77,11 +77,12 @@ class DopamineSignal(BaseSignal):
         response: str = None,
         feedback: str = None,
         memories: list[Memory] = None,
+        encoder=None,
     ) -> list[SignalEvent]:
         events = []
         msg_lower = message.lower() if message else ""
 
-        # Check explicit positive feedback
+        # Check explicit feedback (API-level, always first)
         if feedback and feedback.lower() == "positive":
             events.append(
                 SignalEvent(
@@ -92,7 +93,6 @@ class DopamineSignal(BaseSignal):
             )
             return events
 
-        # Check for correction feedback
         if feedback and feedback.lower().startswith("correction:"):
             correction_content = feedback[len("correction:") :].strip()
             events.append(
@@ -104,45 +104,39 @@ class DopamineSignal(BaseSignal):
             )
             return events
 
-        # Check correction patterns
-        for pattern in CORRECTION_PATTERNS:
-            if pattern in msg_lower:
-                events.append(
-                    SignalEvent(
+        # ── Encoder-based detection ──
+        # The unified encoder classifies intent from sentence context.
+        # No hardcoded pattern fallback — if encoder isn't trained, signal doesn't fire.
+        if encoder and encoder.available:
+            result = encoder.classify_intent(message)
+            if result:
+                intent, conf = result
+                if intent == "correction" and conf > 0.5:
+                    return [SignalEvent(
                         signal_type=SignalType.DOPAMINE,
                         trigger="user_correction",
-                        details={"pattern": pattern, "message": message},
-                    )
-                )
-                return events
-
-        # Check enthusiasm patterns
-        for pattern in ENTHUSIASM_PATTERNS:
-            if pattern in msg_lower:
-                events.append(
-                    SignalEvent(
+                        details={"encoder_intent": intent, "confidence": conf,
+                                 "message": message},
+                    )]
+                if intent == "enthusiasm" and conf > 0.5:
+                    return [SignalEvent(
                         signal_type=SignalType.DOPAMINE,
                         trigger="user_enthusiasm",
-                        details={"pattern": pattern, "message": message},
-                    )
-                )
-                return events
-
-        # Check personal info patterns
-        for pattern in PERSONAL_INFO_PATTERNS:
-            if pattern in msg_lower:
-                events.append(
-                    SignalEvent(
+                        details={"encoder_intent": intent, "confidence": conf,
+                                 "message": message},
+                    )]
+                if intent == "personal_info" and conf > 0.5:
+                    return [SignalEvent(
                         signal_type=SignalType.DOPAMINE,
                         trigger="novel_personal_info",
-                        details={"pattern": pattern, "message": message},
-                    )
-                )
-                return events
+                        details={"encoder_intent": intent, "confidence": conf,
+                                 "message": message},
+                    )]
 
         return events
 
-    def apply(self, event: SignalEvent, memory_store, embeddings=None) -> None:
+    def apply(self, event: SignalEvent, memory_store, embeddings=None,
+              graph_store=None) -> None:
         details = event.details
         message = details.get("message", "") or details.get("correction", "")
 
@@ -169,6 +163,10 @@ class DopamineSignal(BaseSignal):
                 if m.id != mem.id and not m.is_priority:
                     memory_store.suppress(m.id, SuppressionReason.CONTRADICTED)
                     event.memory_ids_affected.append(m.id)
+
+            # Store correction as training pair for the relation classifier
+            if graph_store is not None:
+                self._store_correction_training_pair(message, graph_store)
 
         elif event.trigger == "novel_personal_info":
             embedding = embeddings.embed(message)
@@ -202,3 +200,39 @@ class DopamineSignal(BaseSignal):
                 for m in related:
                     memory_store.boost_confidence(m.id, min(m.confidence * 1.5, 1.0))
                     event.memory_ids_affected.append(m.id)
+
+    @staticmethod
+    def _store_correction_training_pair(message: str, graph_store):
+        """Parse a correction message for entity-relation patterns and store
+        as training pairs for the contextual relation classifier.
+
+        Positive pair: the correct relation from the correction.
+        Negative pair: the wrong relation being contradicted.
+        """
+        try:
+            from limbiq.graph.entities import RELATION_PATTERNS
+            import re
+
+            for pattern_str, extractor in RELATION_PATTERNS:
+                match = re.search(pattern_str, message)
+                if match:
+                    result = extractor(match)
+                    if result is None:
+                        continue
+                    subj_indicator, predicate, obj_name = result
+                    if subj_indicator == "user":
+                        # Can't create a useful training pair for user-relations
+                        # because "user" isn't an entity name in the sentence
+                        continue
+
+                    # Store as positive training pair
+                    graph_store.store_relation_correction(
+                        sentence=message,
+                        subject_name=subj_indicator,
+                        predicate=predicate,
+                        object_name=obj_name,
+                        is_positive=True,
+                    )
+                    break
+        except Exception:
+            pass  # Best effort — don't break the signal flow

@@ -1,10 +1,15 @@
 from limbiq.signals.gaba import GABASignal
 from limbiq.types import Memory
+from tests.conftest import MockEncoder
 
 
 class TestGABADetection:
     def setup_method(self):
         self.signal = GABASignal()
+        self.encoder = MockEncoder({
+            "i never said": ("denial", 0.9),
+            "making that up": ("denial", 0.9),
+        })
 
     def test_detects_denial(self):
         events = self.signal.detect(
@@ -12,6 +17,7 @@ class TestGABADetection:
             response=None,
             feedback=None,
             memories=[],
+            encoder=self.encoder,
         )
         assert len(events) > 0
         assert events[0].trigger == "user_denial"
@@ -26,6 +32,7 @@ class TestGABADetection:
             response=None,
             feedback=None,
             memories=memories,
+            encoder=self.encoder,
         )
         assert len(events) > 0
         assert "m1" in events[0].memory_ids_affected
@@ -47,6 +54,7 @@ class TestGABADetection:
             response=None,
             feedback=None,
             memories=[],
+            encoder=self.encoder,
         )
         assert len(events) == 0
 

@@ -47,13 +47,16 @@ class GraphStore:
     so it works correctly under Gradio's worker threads.
     """
 
-    def __init__(self, memory_store):
+    def __init__(self, memory_store, entity_state_store=None):
         """
         Args:
             memory_store: A MemoryStore instance — we use its .db property
                           for thread-safe per-thread SQLite connections.
+            entity_state_store: Optional EntityStateStore — if provided,
+                                auto-creates entity state on add_entity().
         """
         self._store = memory_store
+        self._entity_state_store = entity_state_store
         self._init_tables()
 
     def heal(self):
@@ -97,6 +100,16 @@ class GraphStore:
             CREATE INDEX IF NOT EXISTS idx_relations_object ON relations(object_id);
             CREATE INDEX IF NOT EXISTS idx_relations_predicate ON relations(predicate);
             CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name COLLATE NOCASE);
+
+            CREATE TABLE IF NOT EXISTS relation_corrections (
+                id TEXT PRIMARY KEY,
+                sentence TEXT NOT NULL,
+                subject_name TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                object_name TEXT NOT NULL,
+                is_positive INTEGER DEFAULT 1,
+                created_at REAL NOT NULL
+            );
         """)
         self.db.commit()
         self._cleanup_junk_entities()
@@ -383,6 +396,14 @@ class GraphStore:
              entity.source_memory_id, entity.created_at),
         )
         self.db.commit()
+
+        # Auto-create entity state (distributed cellular memory)
+        if self._entity_state_store is not None:
+            try:
+                self._entity_state_store.ensure_state_exists(entity.id)
+            except Exception as e:
+                logger.warning(f"Failed to create entity state for {entity.name}: {e}")
+
         return entity
 
     def find_entity_by_name(self, name: str) -> Optional[Entity]:
@@ -470,6 +491,52 @@ class GraphStore:
                 (ent_a.id, ent_b.id, ent_b.id, ent_a.id),
             )
             self.db.commit()
+
+    # ── Relation corrections (training feedback) ────────────
+
+    def store_relation_correction(
+        self, sentence: str, subject_name: str, predicate: str,
+        object_name: str, is_positive: bool = True,
+    ) -> None:
+        """Store a relation correction as a training pair.
+
+        Args:
+            sentence: The original sentence text.
+            subject_name: Subject entity name.
+            predicate: The relation predicate.
+            object_name: Object entity name.
+            is_positive: True = correct relation, False = incorrect relation.
+        """
+        self.db.execute(
+            "INSERT INTO relation_corrections "
+            "(id, sentence, subject_name, predicate, object_name, is_positive, created_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (str(uuid.uuid4())[:12], sentence, subject_name, predicate,
+             object_name, int(is_positive), time.time()),
+        )
+        self.db.commit()
+
+    def get_relation_corrections(self) -> list[dict]:
+        """Get all stored relation corrections for training."""
+        rows = self.db.execute(
+            "SELECT sentence, subject_name, predicate, object_name, is_positive "
+            "FROM relation_corrections ORDER BY created_at"
+        ).fetchall()
+        return [
+            {
+                "sentence": r[0], "subject_name": r[1], "predicate": r[2],
+                "object_name": r[3], "is_positive": bool(r[4]),
+            }
+            for r in rows
+        ]
+
+    def count_corrections_since(self, since_timestamp: float) -> int:
+        """Count corrections stored since a given timestamp."""
+        row = self.db.execute(
+            "SELECT COUNT(*) FROM relation_corrections WHERE created_at > ?",
+            (since_timestamp,),
+        ).fetchone()
+        return row[0] if row else 0
 
     # ── Stats ─────────────────────────────────────────────────
 

@@ -89,6 +89,16 @@ class EmbeddingEngine:
 
         return vector
 
+    def embed_tokens(self, text: str) -> list[list[float]]:
+        """Per-token embeddings for whitespace-split tokens.
+
+        Each token is embedded via the same engine (with caching).
+        Used by the contextual relation classifier for self-attention
+        over sentence tokens.
+        """
+        tokens = text.split()
+        return [self.embed(token) for token in tokens]
+
     def similarity(self, embedding_a: list[float], embedding_b: list[float]) -> float:
         """Cosine similarity between two embeddings."""
         if len(embedding_a) != len(embedding_b):

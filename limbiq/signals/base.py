@@ -17,9 +17,11 @@ class BaseSignal(ABC):
         response: str = None,
         feedback: str = None,
         memories: list[Memory] = None,
+        encoder=None,
     ) -> list[SignalEvent]:
         pass
 
     @abstractmethod
-    def apply(self, event: SignalEvent, memory_store, embeddings=None) -> None:
+    def apply(self, event: SignalEvent, memory_store, embeddings=None,
+              graph_store=None) -> None:
         pass

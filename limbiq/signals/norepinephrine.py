@@ -42,38 +42,36 @@ class NorepinephrineSignal(BaseSignal):
         response: str = None,
         feedback: str = None,
         memories: list[Memory] = None,
+        encoder=None,
     ) -> list[SignalEvent]:
         """Detect in observe() context -- checks frustration and contradiction."""
         events = []
         msg_lower = message.lower() if message else ""
 
-        # Check frustration
-        for pattern in FRUSTRATION_PATTERNS:
-            if pattern in msg_lower:
-                events.append(
-                    SignalEvent(
+        # ── Encoder-based detection ──
+        if encoder and encoder.available:
+            result = encoder.classify_intent(message)
+            if result:
+                intent, conf = result
+                if intent == "frustration" and conf > 0.5:
+                    return [SignalEvent(
                         signal_type=SignalType.NOREPINEPHRINE,
                         trigger="user_frustration",
-                        details={"pattern": pattern, "message": message[:200]},
-                    )
-                )
-                return events
-
-        # Check contradiction markers (user correcting stored info)
-        for pattern in CONTRADICTION_MARKERS:
-            if pattern in msg_lower and memories:
-                events.append(
-                    SignalEvent(
+                        details={"encoder_intent": intent, "confidence": conf,
+                                 "message": message[:200]},
+                    )]
+                if intent == "contradiction" and conf > 0.5:
+                    return [SignalEvent(
                         signal_type=SignalType.NOREPINEPHRINE,
                         trigger="potential_contradiction",
-                        details={"pattern": pattern, "message": message[:200]},
-                    )
-                )
-                return events
+                        details={"encoder_intent": intent, "confidence": conf,
+                                 "message": message[:200]},
+                    )]
 
         return events
 
-    def apply(self, event: SignalEvent, memory_store, embeddings=None) -> None:
+    def apply(self, event: SignalEvent, memory_store, embeddings=None,
+              graph_store=None) -> None:
         # Effects are applied transiently in process(), not stored
         pass
 

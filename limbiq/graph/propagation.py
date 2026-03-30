@@ -143,11 +143,13 @@ class ActiveGraphPropagation:
     """
 
     def __init__(self, store: MemoryStore, graph: GraphStore,
-                 embedding_engine=None, user_name: str = "Dimuthu"):
+                 embedding_engine=None, user_name: str = "Dimuthu",
+                 entity_state_store=None):
         self.store = store
         self.graph = graph
         self.embeddings = embedding_engine
         self.user_name = user_name
+        self.entity_state_store = entity_state_store
 
         # Propagation parameters
         self.decay_rate = 0.85          # Activation decay per step
@@ -422,6 +424,53 @@ class ActiveGraphPropagation:
     # ═══════════════════════════════════════════════════════════════
     # 5. ACTIVATION COMPUTATION
     # ═══════════════════════════════════════════════════════════════
+    def _compute_memory_resting_boosts(self, memory_ids: list, memories: list) -> dict:
+        """Compute resting activation boost per memory from connected entities.
+
+        Memories that mention entities with high resting activation get a
+        base activation boost — like how neural pathways near frequently-
+        firing neurons have lower thresholds.
+        """
+        boosts = {}
+        if not self.entity_state_store:
+            return boosts
+
+        try:
+            entities = self.graph.get_all_entities()
+            if not entities:
+                return boosts
+
+            # Build name → max resting activation map
+            name_activation = {}
+            for entity in entities:
+                if len(entity.name) <= 1:
+                    continue
+                state = self.entity_state_store.get_state(entity.id)
+                if state.resting_activation > 0.01:
+                    name_activation[entity.name.lower()] = max(
+                        name_activation.get(entity.name.lower(), 0),
+                        state.resting_activation,
+                    )
+
+            if not name_activation:
+                return boosts
+
+            # For each memory, check if it mentions any activated entity
+            for i, m in enumerate(memories):
+                if i >= len(memory_ids):
+                    break
+                content_lower = m[1].lower() if m[1] else ""
+                max_act = 0.0
+                for name, act in name_activation.items():
+                    if name in content_lower:
+                        max_act = max(max_act, act)
+                if max_act > 0:
+                    boosts[memory_ids[i]] = max_act
+        except Exception as e:
+            logger.warning(f"Memory resting boost computation failed: {e}")
+
+        return boosts
+
     def compute_activations(self, query_embedding=None) -> list[ActivationState]:
         """
         Compute activation states for all active memory nodes.
@@ -473,7 +522,11 @@ class ActiveGraphPropagation:
         n = len(ids)
         activations = np.zeros(n)
 
-        # Base activation from intrinsic properties
+        # Build resting activation boost map from entity state
+        # Memories connected to high-activation entities start with a higher base
+        resting_boosts = self._compute_memory_resting_boosts(ids, memories)
+
+        # Base activation from intrinsic properties + entity resting state
         for i, m in enumerate(memories):
             if i >= n:
                 break
@@ -486,6 +539,10 @@ class ActiveGraphPropagation:
             recency = 1.0 / (1.0 + session_count * 0.1)
             popularity = min(1.0, access_count / 20.0)
             c_value = confidence * 0.4 + recency * 0.2 + popularity * 0.2 + (0.2 if is_priority else 0)
+
+            # Add resting activation from connected entities (capped at 0.15)
+            resting = min(0.15, resting_boosts.get(ids[i], 0.0))
+            c_value += resting
 
             activations[i] = c_value
 

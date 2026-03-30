@@ -20,6 +20,28 @@ def lq(tmp_dir):
     return Limbiq(store_path=tmp_dir, user_id="test")
 
 
+class MockEncoder:
+    """Mock encoder for signal unit tests — returns pre-configured intents."""
+
+    available = True
+
+    def __init__(self, intent_map: dict[str, tuple[str, float]] | None = None):
+        self._intent_map = intent_map or {}
+
+    def classify_intent(self, message: str):
+        msg_lower = message.lower() if message else ""
+        for keyword, result in self._intent_map.items():
+            if keyword in msg_lower:
+                return result
+        return None
+
+
+@pytest.fixture
+def mock_encoder():
+    """Create a MockEncoder with custom intent mappings."""
+    return MockEncoder
+
+
 @pytest.fixture
 def mock_llm():
     """A mock LLM function for compression tests."""

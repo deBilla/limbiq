@@ -3,40 +3,59 @@
 from limbiq import Limbiq
 from limbiq.types import SignalType, RetrievalConfig
 from limbiq.signals.norepinephrine import NorepinephrineSignal
+from tests.conftest import MockEncoder
+
+
+def _make_ne_encoder():
+    return MockEncoder({
+        "i already told you": ("frustration", 0.9),
+        "wrong again": ("frustration", 0.9),
+        "are you even listening": ("frustration", 0.9),
+        "pay attention": ("frustration", 0.9),
+        "actually i": ("contradiction", 0.85),
+        "just moved": ("contradiction", 0.85),
+    })
 
 
 class TestNorepinephrineDetection:
     def test_detects_frustration(self):
         signal = NorepinephrineSignal()
+        encoder = _make_ne_encoder()
         events = signal.detect(
             message="I already told you my name, why don't you remember?",
             response="I apologize...",
             memories=[],
+            encoder=encoder,
         )
         assert len(events) >= 1
         assert events[0].trigger == "user_frustration"
 
     def test_detects_frustration_patterns(self):
         signal = NorepinephrineSignal()
+        encoder = _make_ne_encoder()
         for phrase in ["I already told you", "wrong again", "are you even listening"]:
-            events = signal.detect(message=phrase, memories=[])
+            events = signal.detect(message=phrase, memories=[], encoder=encoder)
             assert len(events) >= 1, f"Should detect frustration in: {phrase}"
 
     def test_no_signal_on_normal_message(self):
         signal = NorepinephrineSignal()
+        encoder = _make_ne_encoder()
         events = signal.detect(
             message="What's the weather like?",
             memories=[],
+            encoder=encoder,
         )
         assert len(events) == 0
 
     def test_detects_contradiction_markers(self):
         from limbiq.types import Memory
         signal = NorepinephrineSignal()
+        encoder = _make_ne_encoder()
         memories = [Memory(id="m1", content="User works at Google")]
         events = signal.detect(
             message="Actually I just moved to a new company",
             memories=memories,
+            encoder=encoder,
         )
         assert len(events) >= 1
         assert events[0].trigger == "potential_contradiction"
@@ -64,6 +83,9 @@ class TestNorepinephrineEffects:
         lq = Limbiq(store_path=tmp_dir, user_id="test")
         lq.start_session()
 
+        # Inject a mock encoder into the core so observe() can detect frustration
+        lq._core.encoder = _make_ne_encoder()
+
         lq.dopamine("User's name is Dimuthu")
         events = lq.observe(
             "I already told you my name, why don't you remember?",
@@ -81,6 +103,9 @@ class TestNorepinephrineEffects:
         lq = Limbiq(store_path=tmp_dir, user_id="test")
         lq.start_session()
 
+        # Inject mock encoder
+        lq._core.encoder = _make_ne_encoder()
+
         # Trigger norepinephrine
         lq.observe("I already told you about this!", "Sorry...")
         result1 = lq.process("Tell me again")
@@ -88,7 +113,6 @@ class TestNorepinephrineEffects:
 
         # Next call should be back to normal (no pending NE events)
         result2 = lq.process("Unrelated normal question about weather")
-        # Caution should not persist (unless topic shift fires again)
         # The key test is that _pending_ne_events was cleared
         assert lq._core._pending_ne_events == []
 
@@ -123,6 +147,9 @@ class TestNorepinephrineEffects:
         """Norepinephrine fires during observe on frustration."""
         lq = Limbiq(store_path=tmp_dir, user_id="test")
         lq.start_session()
+
+        # Inject mock encoder
+        lq._core.encoder = _make_ne_encoder()
 
         events = lq.observe(
             "I already told you, pay attention!",

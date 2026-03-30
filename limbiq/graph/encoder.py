@@ -83,10 +83,13 @@ PREDICATE_LABELS = [
     "father", "mother", "wife", "husband", "brother", "sister",
     "son", "daughter", "pet", "works_at", "lives_in", "role",
     "friend", "colleague", "boss", "interested_in", "has_condition",
-    "related_to",
+    "related_to", "none",
 ]
 PRED_TO_IDX = {p: i for i, p in enumerate(PREDICATE_LABELS)}
 IDX_TO_PRED = {i: p for i, p in enumerate(PREDICATE_LABELS)}
+
+# Model version — incremented when architecture changes (skip loading old weights)
+_RELATION_CLASSIFIER_VERSION = 2
 
 
 if _torch_available:
@@ -107,25 +110,102 @@ if _torch_available:
             """Input: (batch, input_dim) → Output: (batch, num_types)"""
             return self.net(span_embedding)
 
-    class RelationClassifier(nn.Module):
-        """Classifies relation type from concatenated subject+object embeddings."""
+    class ContextualRelationClassifier(nn.Module):
+        """Self-attention relation classifier that sees sentence context.
 
-        def __init__(self, input_dim: int = 384, hidden_dim: int = 128):
+        Unlike the old MLP that only saw [subj_emb; obj_emb; product],
+        this module attends over the full sentence tokens — especially the
+        words BETWEEN entities — to determine directionality and predicate.
+
+        Architecture (~55K params):
+          1. Project tokens: 384-dim → 64-dim
+          2. Add learned entity markers to subject/object spans
+          3. Single-layer self-attention (2 heads, 64-dim)
+          4. Entity-aware pooling: [subj_repr; between_repr; obj_repr]
+          5. Classify: 192-dim → 19 predicates (18 + "none")
+        """
+
+        def __init__(self, input_dim: int = 384, proj_dim: int = 64):
             super().__init__()
-            # Input is [subject_emb; object_emb; element-wise product]
-            self.net = nn.Sequential(
-                nn.Linear(input_dim * 3, hidden_dim),
+            self.proj_dim = proj_dim
+
+            # Step 1: Project down
+            self.projection = nn.Linear(input_dim, proj_dim)
+
+            # Step 2: Learned entity markers
+            self.subj_marker = nn.Parameter(torch.randn(proj_dim) * 0.02)
+            self.obj_marker = nn.Parameter(torch.randn(proj_dim) * 0.02)
+
+            # Step 3: Self-attention
+            self.self_attn = nn.MultiheadAttention(
+                embed_dim=proj_dim, num_heads=2, batch_first=True,
+                dropout=0.1,
+            )
+            self.attn_norm = nn.LayerNorm(proj_dim)
+            self.ff = nn.Sequential(
+                nn.Linear(proj_dim, proj_dim * 2),
                 nn.GELU(),
                 nn.Dropout(0.1),
-                nn.Linear(hidden_dim, hidden_dim // 2),
+                nn.Linear(proj_dim * 2, proj_dim),
+            )
+            self.ff_norm = nn.LayerNorm(proj_dim)
+
+            # Step 5: Classification head
+            # Input: [subj_repr; between_repr; obj_repr] = 3 * proj_dim
+            self.classifier = nn.Sequential(
+                nn.Linear(proj_dim * 3, proj_dim),
                 nn.GELU(),
-                nn.Linear(hidden_dim // 2, len(PREDICATE_LABELS)),
+                nn.Dropout(0.2),
+                nn.Linear(proj_dim, len(PREDICATE_LABELS)),
             )
 
-        def forward(self, subj_emb: torch.Tensor, obj_emb: torch.Tensor) -> torch.Tensor:
-            """Input: two (batch, dim) tensors → Output: (batch, num_predicates)"""
-            combined = torch.cat([subj_emb, obj_emb, subj_emb * obj_emb], dim=-1)
-            return self.net(combined)
+        def forward(
+            self,
+            token_embs: torch.Tensor,
+            subj_mask: torch.Tensor,
+            obj_mask: torch.Tensor,
+            between_mask: torch.Tensor,
+        ) -> torch.Tensor:
+            """
+            Args:
+                token_embs: (batch, seq_len, input_dim) token embeddings
+                subj_mask: (batch, seq_len) 1.0 for subject tokens
+                obj_mask: (batch, seq_len) 1.0 for object tokens
+                between_mask: (batch, seq_len) 1.0 for tokens between entities
+
+            Returns:
+                (batch, num_predicates) logits
+            """
+            # Step 1: Project down
+            x = self.projection(token_embs)  # (batch, seq_len, proj_dim)
+
+            # Step 2: Inject entity markers
+            x = x + subj_mask.unsqueeze(-1) * self.subj_marker
+            x = x + obj_mask.unsqueeze(-1) * self.obj_marker
+
+            # Step 3: Self-attention + residual + norm
+            attn_out, _ = self.self_attn(x, x, x)
+            x = self.attn_norm(x + attn_out)
+
+            # Feed-forward + residual + norm
+            ff_out = self.ff(x)
+            x = self.ff_norm(x + ff_out)
+
+            # Step 4: Entity-aware pooling
+            subj_repr = self._masked_mean(x, subj_mask)
+            obj_repr = self._masked_mean(x, obj_mask)
+            between_repr = self._masked_mean(x, between_mask)
+
+            # Step 5: Classify
+            combined = torch.cat([subj_repr, between_repr, obj_repr], dim=-1)
+            return self.classifier(combined)
+
+        @staticmethod
+        def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+            """Mean pool over masked positions. Falls back to zero if no positions."""
+            mask_expanded = mask.unsqueeze(-1)  # (batch, seq, 1)
+            count = mask_expanded.sum(dim=1).clamp(min=1)  # (batch, 1)
+            return (x * mask_expanded).sum(dim=1) / count  # (batch, dim)
 
     class SpanDetector(nn.Module):
         """Detects entity spans from token embeddings using BIO tagging.
@@ -176,7 +256,7 @@ class TransformerEntityEncoder:
         if _torch_available:
             dim = self._get_embedding_dim()
             self.type_classifier = EntityTypeClassifier(input_dim=dim)
-            self.relation_classifier = RelationClassifier(input_dim=dim)
+            self.relation_classifier = ContextualRelationClassifier(input_dim=dim)
             self.span_detector = SpanDetector(input_dim=dim)
             self._try_load_models()
 
@@ -186,10 +266,14 @@ class TransformerEntityEncoder:
         return len(test)
 
     def _try_load_models(self):
-        """Load pretrained classifier weights if available."""
+        """Load pretrained classifier weights if available.
+
+        Uses version check for relation classifier — old MLP weights
+        are incompatible with the new ContextualRelationClassifier.
+        """
         import os
         type_path = os.path.join(self.model_dir, "type_classifier.pt")
-        rel_path = os.path.join(self.model_dir, "relation_classifier.pt")
+        rel_path = os.path.join(self.model_dir, "relation_classifier_v2.pt")
         span_path = os.path.join(self.model_dir, "span_detector.pt")
 
         loaded = 0
@@ -421,31 +505,73 @@ class TransformerEntityEncoder:
     def _classify_relations(
         self, entities: list[EncodedEntity], text: str, user_name: str
     ) -> list[EncodedRelation]:
-        """Classify relations between entity pairs.
+        """Classify relations between entity pairs using self-attention.
 
-        Uses learned classifier when available, otherwise context-based heuristics.
-        Only considers pairs that appear in the same sentence or near each other.
+        The contextual classifier sees the full sentence tokens and attends
+        to words between entities to determine directionality and predicate.
+        Falls back gracefully when torch/classifier not available.
         """
         relations = []
+
+        if not (_torch_available and self.relation_classifier is not None):
+            return relations  # Defer to regex pipeline in entities.py
+
+        # Get token-level embeddings for the sentence
+        tokens = text.split()
+        if not tokens:
+            return relations
+
+        token_embs = [self.embedding_engine.embed(t) for t in tokens]
+        token_tensor = torch.tensor([token_embs], dtype=torch.float32)  # (1, seq, dim)
+        seq_len = len(tokens)
+
+        # Build character-to-token index for span mapping
+        char_to_token = {}
+        pos = 0
+        for i, token in enumerate(tokens):
+            start = text.find(token, pos)
+            for c in range(start, start + len(token)):
+                char_to_token[c] = i
+            pos = start + len(token)
 
         for i, subj in enumerate(entities):
             for j, obj in enumerate(entities):
                 if i == j:
                     continue
 
-                # Check proximity (within ~100 chars of each other in text)
                 distance = abs(subj.span_start - obj.span_start)
                 if distance > 150:
                     continue
 
-                if self._model_loaded and self.relation_classifier is not None:
-                    pred, conf = self._classify_relation_learned(subj, obj)
-                else:
-                    pred, conf = self._classify_relation_heuristic(
-                        subj, obj, text, user_name
-                    )
+                # Build masks
+                subj_mask = torch.zeros(1, seq_len)
+                obj_mask = torch.zeros(1, seq_len)
+                between_mask = torch.zeros(1, seq_len)
 
-                if pred and conf > 0.3:
+                for c in range(subj.span_start, subj.span_end):
+                    if c in char_to_token:
+                        subj_mask[0, char_to_token[c]] = 1.0
+
+                for c in range(obj.span_start, obj.span_end):
+                    if c in char_to_token:
+                        obj_mask[0, char_to_token[c]] = 1.0
+
+                # Between = tokens between the two entity spans
+                between_start = min(subj.span_end, obj.span_end)
+                between_end = max(subj.span_start, obj.span_start)
+                for c in range(between_start, between_end):
+                    if c in char_to_token:
+                        between_mask[0, char_to_token[c]] = 1.0
+
+                # If no between tokens, use a small window around entities
+                if between_mask.sum() == 0:
+                    continue  # Adjacent/overlapping entities, skip
+
+                pred, conf = self._classify_relation_contextual(
+                    token_tensor, subj_mask, obj_mask, between_mask
+                )
+
+                if pred and pred != "none" and conf > 0.3:
                     relations.append(EncodedRelation(
                         subject=subj,
                         predicate=pred,
@@ -455,100 +581,24 @@ class TransformerEntityEncoder:
 
         return relations
 
-    def _classify_relation_learned(
-        self, subj: EncodedEntity, obj: EncodedEntity
+    def _classify_relation_contextual(
+        self,
+        token_embs: "torch.Tensor",
+        subj_mask: "torch.Tensor",
+        obj_mask: "torch.Tensor",
+        between_mask: "torch.Tensor",
     ) -> tuple[Optional[str], float]:
-        """Use trained relation classifier."""
-        subj_t = torch.tensor([subj.embedding], dtype=torch.float32)
-        obj_t = torch.tensor([obj.embedding], dtype=torch.float32)
-
+        """Use the contextual self-attention classifier."""
         with torch.no_grad():
-            logits = self.relation_classifier(subj_t, obj_t)
+            logits = self.relation_classifier(
+                token_embs, subj_mask, obj_mask, between_mask
+            )
             probs = F.softmax(logits, dim=-1)
             pred_idx = torch.argmax(probs, dim=-1).item()
             conf = probs[0, pred_idx].item()
 
         pred = IDX_TO_PRED.get(pred_idx)
         return pred, conf
-
-    def _classify_relation_heuristic(
-        self, subj: EncodedEntity, obj: EncodedEntity,
-        text: str, user_name: str
-    ) -> tuple[Optional[str], float]:
-        """Context-based relation classification.
-
-        IMPORTANT: Only creates a relation when the keyword appears
-        BETWEEN the two entity mentions (not anywhere in the text).
-        This prevents "Prabhashi's father is Chandrasiri" from also
-        creating "Renuka→father→Chandrasiri" just because "father"
-        appears somewhere in the text.
-        """
-        # Extract text strictly between the two entity spans
-        first_end = min(subj.span_end, obj.span_end)
-        second_start = max(subj.span_start, obj.span_start)
-        if first_end >= second_start:
-            # Overlapping or adjacent — no space for relation keyword
-            return None, 0.0
-        between = text[first_end:second_start].lower().strip()
-
-        if not between:
-            return None, 0.0
-
-        # Stop at clause boundaries — don't match across commas, periods,
-        # semicolons, or "and"/"but" conjunctions. This prevents
-        # "Prabhashi's father is Chandrasiri, My Dog is Dexter" from
-        # creating a relation between Prabhashi and Dexter via "father".
-        clause_break = re.search(r'[,;.]|\band\b|\bbut\b', between)
-        if clause_break:
-            # Only use text up to the first clause break
-            between = between[:clause_break.start()].strip()
-
-        # Determine which entity came first in the text
-        if subj.span_start < obj.span_start:
-            first_ent, second_ent = subj, obj
-        else:
-            first_ent, second_ent = obj, subj
-
-        # Family relations — keyword must be BETWEEN the entities
-        # Patterns: "X's father is Y" → X→father→Y
-        #           "X father Y"      → X→father→Y
-        #
-        # IMPORTANT: Skip when keyword is preceded by "my"/"our" — that
-        # indicates the USER's relation, not a relation between the two
-        # entities. E.g., "Prabhashi called my mom Renuka" → "my mom" is
-        # the user's mother, NOT Prabhashi's mother.
-        family_map = {
-            "father": ["father", "dad", "papa", "pa"],
-            "mother": ["mother", "mom", "mum", "mama", "ma"],
-            "wife": ["wife", "married to", "spouse"],
-            "husband": ["husband", "married to", "spouse"],
-            "brother": ["brother", "bro"],
-            "sister": ["sister", "sis"],
-            "son": ["son"],
-            "daughter": ["daughter"],
-            "pet": ["dog", "cat", "pet", "puppy", "animal"],
-        }
-
-        for pred, keywords in family_map.items():
-            for kw in keywords:
-                if kw in between:
-                    # If keyword is preceded by "my" or "our", this is the
-                    # USER's relation, not a relation between these entities.
-                    # E.g., "called my mom" → user's mother, skip.
-                    if re.search(rf'\b(?:my|our)\s+{re.escape(kw)}\b', between):
-                        continue
-                    if first_ent is subj:
-                        return pred, 0.7
-                    else:
-                        return pred, 0.7
-
-        # Work/location relations
-        if "work" in between and ("at" in between or "for" in between):
-            return "works_at", 0.7
-        if "live" in between and "in" in between:
-            return "lives_in", 0.7
-
-        return None, 0.0
 
     # ── Training ─────────────────────────────────────────────
 
@@ -606,52 +656,229 @@ class TransformerEntityEncoder:
                 os.path.join(self.model_dir, "type_classifier.pt"),
             )
 
-        # ── Train relation classifier ────────────────────────
-        rel_X_subj = []
-        rel_X_obj = []
-        rel_y = []
-        entity_map = {e.id: e for e in entities}
-
-        for rel in relations:
-            if rel.predicate not in PRED_TO_IDX:
-                continue
-            subj = entity_map.get(rel.subject_id)
-            obj = entity_map.get(rel.object_id)
-            if subj and obj:
-                subj_emb = self.embedding_engine.embed(subj.name)
-                obj_emb = self.embedding_engine.embed(obj.name)
-                rel_X_subj.append(subj_emb)
-                rel_X_obj.append(obj_emb)
-                rel_y.append(PRED_TO_IDX[rel.predicate])
-
+        # ── Train contextual relation classifier ────────────
         rel_loss = 0.0
-        if len(rel_y) >= 3:
-            subj_t = torch.tensor(rel_X_subj, dtype=torch.float32)
-            obj_t = torch.tensor(rel_X_obj, dtype=torch.float32)
-            rel_y_t = torch.tensor(rel_y, dtype=torch.long)
-
-            self.relation_classifier.train()
-            optimizer = torch.optim.Adam(self.relation_classifier.parameters(), lr=1e-3)
-
-            for epoch in range(num_epochs):
-                logits = self.relation_classifier(subj_t, obj_t)
-                loss = F.cross_entropy(logits, rel_y_t)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                rel_loss = loss.item()
-
-            self.relation_classifier.eval()
-            torch.save(
-                self.relation_classifier.state_dict(),
-                os.path.join(self.model_dir, "relation_classifier.pt"),
-            )
+        rel_samples = self._train_relation_classifier(
+            graph_store, entities, relations, num_epochs
+        )
+        if isinstance(rel_samples, dict):
+            rel_loss = rel_samples.get("loss", 0.0)
+            rel_count = rel_samples.get("samples", 0)
+        else:
+            rel_count = 0
 
         self._model_loaded = True
         return {
             "status": "trained",
             "type_samples": len(type_X),
-            "relation_samples": len(rel_y),
+            "relation_samples": rel_count,
             "type_loss": round(type_loss, 4),
             "relation_loss": round(rel_loss, 4),
+        }
+
+    def _train_relation_classifier(
+        self, graph_store, entities, relations, num_epochs: int = 50
+    ) -> dict:
+        """Train the contextual relation classifier using synthetic sentences.
+
+        Generates training data by synthesizing canonical sentences from
+        graph relations and optional user corrections. The self-attention
+        module needs token-level input with entity span masks.
+        """
+        import os
+        if not _torch_available or self.relation_classifier is None:
+            return {"samples": 0, "loss": 0.0}
+
+        entity_map = {e.id: e for e in entities}
+
+        # ── Sentence templates for bootstrap training ──
+        TEMPLATES = {
+            "father": ["{subj}'s father is {obj}", "{obj} is {subj}'s father"],
+            "mother": ["{subj}'s mother is {obj}", "{obj} is {subj}'s mother"],
+            "wife": ["{subj}'s wife is {obj}", "{obj} is {subj}'s wife"],
+            "husband": ["{subj}'s husband is {obj}", "{obj} is {subj}'s husband"],
+            "brother": ["{subj}'s brother is {obj}", "{obj} is {subj}'s brother"],
+            "sister": ["{subj}'s sister is {obj}", "{obj} is {subj}'s sister"],
+            "son": ["{subj}'s son is {obj}", "{obj} is {subj}'s son"],
+            "daughter": ["{subj}'s daughter is {obj}", "{obj} is {subj}'s daughter"],
+            "pet": ["{subj}'s pet is {obj}", "{subj} has a pet named {obj}"],
+            "works_at": ["{subj} works at {obj}", "{subj} is employed at {obj}"],
+            "lives_in": ["{subj} lives in {obj}", "{subj} is based in {obj}"],
+            "friend": ["{subj}'s friend is {obj}", "{obj} is {subj}'s friend"],
+            "colleague": ["{subj}'s colleague is {obj}", "{obj} is {subj}'s colleague"],
+        }
+
+        training_data = []  # [(sentence, subj_name, obj_name, predicate_idx, weight)]
+
+        # Generate from graph relations
+        for rel in relations:
+            if rel.predicate not in PRED_TO_IDX:
+                continue
+            subj = entity_map.get(rel.subject_id)
+            obj = entity_map.get(rel.object_id)
+            if not subj or not obj:
+                continue
+
+            templates = TEMPLATES.get(rel.predicate, ["{subj} {obj}"])
+            for template in templates:
+                sentence = template.format(subj=subj.name, obj=obj.name)
+                training_data.append((
+                    sentence, subj.name, obj.name,
+                    PRED_TO_IDX[rel.predicate], 1.0
+                ))
+
+        # Add user corrections (5x weight)
+        try:
+            corrections = graph_store.get_relation_corrections()
+            for corr in corrections:
+                if corr["predicate"] not in PRED_TO_IDX:
+                    continue
+                target = PRED_TO_IDX[corr["predicate"]] if corr["is_positive"] \
+                    else PRED_TO_IDX["none"]
+                weight = 5.0
+                training_data.append((
+                    corr["sentence"], corr["subject_name"], corr["object_name"],
+                    target, weight
+                ))
+        except Exception:
+            pass  # No corrections table yet
+
+        if len(training_data) < 3:
+            return {"samples": 0, "loss": 0.0}
+
+        # Build training tensors
+        all_token_embs = []
+        all_subj_masks = []
+        all_obj_masks = []
+        all_between_masks = []
+        all_labels = []
+        all_weights = []
+
+        for sentence, subj_name, obj_name, label, weight in training_data:
+            tokens = sentence.split()
+            if not tokens:
+                continue
+
+            # Embed tokens
+            token_embs = [self.embedding_engine.embed(t) for t in tokens]
+
+            # Find subject and object token positions
+            subj_mask = [0.0] * len(tokens)
+            obj_mask = [0.0] * len(tokens)
+            between_mask = [0.0] * len(tokens)
+
+            subj_start = subj_end = obj_start = obj_end = -1
+            subj_tokens = subj_name.split()
+            obj_tokens = obj_name.split()
+
+            # Find subject span
+            for k in range(len(tokens) - len(subj_tokens) + 1):
+                if tokens[k:k + len(subj_tokens)] == subj_tokens:
+                    subj_start = k
+                    subj_end = k + len(subj_tokens)
+                    for m in range(subj_start, subj_end):
+                        subj_mask[m] = 1.0
+                    break
+
+            # Find object span
+            for k in range(len(tokens) - len(obj_tokens) + 1):
+                if tokens[k:k + len(obj_tokens)] == obj_tokens:
+                    obj_start = k
+                    obj_end = k + len(obj_tokens)
+                    for m in range(obj_start, obj_end):
+                        obj_mask[m] = 1.0
+                    break
+
+            if subj_start == -1 or obj_start == -1:
+                continue
+
+            # Between mask
+            btwn_start = min(subj_end, obj_end)
+            btwn_end = max(subj_start, obj_start)
+            for k in range(btwn_start, btwn_end):
+                between_mask[k] = 1.0
+
+            all_token_embs.append(token_embs)
+            all_subj_masks.append(subj_mask)
+            all_obj_masks.append(obj_mask)
+            all_between_masks.append(between_mask)
+            all_labels.append(label)
+            all_weights.append(weight)
+
+        if not all_labels:
+            return {"samples": 0, "loss": 0.0}
+
+        # Pad sequences to same length
+        max_len = max(len(t) for t in all_token_embs)
+        dim = len(all_token_embs[0][0])
+
+        padded_embs = []
+        padded_subj = []
+        padded_obj = []
+        padded_btwn = []
+        for embs, sm, om, bm in zip(
+            all_token_embs, all_subj_masks, all_obj_masks, all_between_masks
+        ):
+            pad_len = max_len - len(embs)
+            padded_embs.append(embs + [[0.0] * dim] * pad_len)
+            padded_subj.append(sm + [0.0] * pad_len)
+            padded_obj.append(om + [0.0] * pad_len)
+            padded_btwn.append(bm + [0.0] * pad_len)
+
+        embs_t = torch.tensor(padded_embs, dtype=torch.float32)
+        subj_t = torch.tensor(padded_subj, dtype=torch.float32)
+        obj_t = torch.tensor(padded_obj, dtype=torch.float32)
+        btwn_t = torch.tensor(padded_btwn, dtype=torch.float32)
+        labels_t = torch.tensor(all_labels, dtype=torch.long)
+        weights_t = torch.tensor(all_weights, dtype=torch.float32)
+
+        # Train
+        self.relation_classifier.train()
+        optimizer = torch.optim.AdamW(
+            self.relation_classifier.parameters(), lr=1e-3, weight_decay=1e-2
+        )
+
+        rel_loss = 0.0
+        for epoch in range(num_epochs):
+            logits = self.relation_classifier(embs_t, subj_t, obj_t, btwn_t)
+            # Weighted cross-entropy
+            per_sample_loss = F.cross_entropy(logits, labels_t, reduction="none")
+            loss = (per_sample_loss * weights_t).mean()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            rel_loss = loss.item()
+
+        self.relation_classifier.eval()
+        torch.save(
+            self.relation_classifier.state_dict(),
+            os.path.join(self.model_dir, "relation_classifier_v2.pt"),
+        )
+
+        return {"samples": len(all_labels), "loss": round(rel_loss, 4)}
+
+    def incremental_train(self, graph_store, num_epochs: int = 20) -> dict:
+        """Fine-tune relation classifier using correction feedback.
+
+        Called when enough user corrections have accumulated (>= 3).
+        Combines corrections (5x weight) with graph relations (1x weight).
+        """
+        if not _torch_available:
+            return {"status": "torch_unavailable"}
+
+        import os
+        os.makedirs(self.model_dir, exist_ok=True)
+
+        entities = graph_store.get_all_entities()
+        relations = graph_store.get_all_relations(include_inferred=False)
+
+        result = self._train_relation_classifier(
+            graph_store, entities, relations, num_epochs
+        )
+
+        self._model_loaded = True
+        return {
+            "status": "retrained",
+            "relation_samples": result.get("samples", 0),
+            "relation_loss": result.get("loss", 0.0),
         }
