@@ -64,7 +64,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LIMBIQ_STORE_PATH` | `./neuro_data` | Directory for SQLite + FAISS data |
+| `LIMBIQ_STORE_PATH` | `~/.limbiq/data` | Directory for SQLite + FAISS data |
 | `LIMBIQ_USER_ID` | `jan_user` | User identifier for memory isolation |
 
 ### 4. Use it

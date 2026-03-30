@@ -37,7 +37,7 @@ for _name in ["limbiq", "sentence_transformers", "transformers", "torch", "httpx
 from mcp.server.fastmcp import FastMCP
 from limbiq import Limbiq
 
-STORE_PATH = os.environ.get("LIMBIQ_STORE_PATH", "./neuro_data")
+STORE_PATH = os.environ.get("LIMBIQ_STORE_PATH", os.path.join(os.path.expanduser("~"), ".limbiq", "data"))
 USER_ID = os.environ.get("LIMBIQ_USER_ID", "jan_user")
 
 lq = Limbiq(store_path=STORE_PATH, user_id=USER_ID)
