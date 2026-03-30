@@ -372,6 +372,9 @@ class LimbiqCore:
         if _correction_events:
             self._learn_from_correction(message, _correction_events)
 
+        # Persist FAISS index after each observe so it survives crashes
+        self.store.save_index()
+
         # Clear embedding cache
         self._cached_query_text = None
         self._cached_query_embedding = None
