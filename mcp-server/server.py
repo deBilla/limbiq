@@ -31,9 +31,8 @@ logging.basicConfig(
     filename=os.path.join(tempfile.gettempdir(), "limbiq_mcp.log"),
     level=logging.WARNING,
 )
-for _name in ["sentence_transformers", "transformers", "torch", "httpx"]:
+for _name in ["limbiq", "sentence_transformers", "transformers", "torch", "httpx"]:
     logging.getLogger(_name).setLevel(logging.ERROR)
-logging.getLogger("limbiq").setLevel(logging.DEBUG)
 
 from mcp.server.fastmcp import FastMCP
 from limbiq import Limbiq
