@@ -39,8 +39,8 @@ from limbiq import Limbiq
 
 STORE_PATH = os.environ.get("LIMBIQ_STORE_PATH", os.path.join(os.path.expanduser("~"), ".limbiq", "data"))
 USER_ID = os.environ.get("LIMBIQ_USER_ID", "jan_user")
-LLM_URL = os.environ.get("LIMBIQ_LLM_URL", "")  # e.g. http://localhost:11434/v1
-LLM_MODEL = os.environ.get("LIMBIQ_LLM_MODEL", "")  # e.g. llama3.1
+LLM_URL = os.environ.get("LIMBIQ_LLM_URL", "http://localhost:11434/v1")
+LLM_MODEL = os.environ.get("LIMBIQ_LLM_MODEL", "qwen2.5-coder:14b")
 
 
 def _make_llm_fn():
