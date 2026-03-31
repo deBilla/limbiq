@@ -35,7 +35,9 @@ Open Jan **Settings > MCP Servers**, click the JSON editor, and add:
     "args": ["/path/to/limbiq/mcp-server/server.py"],
     "env": {
       "LIMBIQ_USER_ID": "your_name",
-      "LIMBIQ_STORE_PATH": "/path/to/your/neuro_data"
+      "LIMBIQ_STORE_PATH": "/path/to/your/neuro_data",
+      "LIMBIQ_LLM_URL": "http://localhost:11434/v1",
+      "LIMBIQ_LLM_MODEL": "llama3.1"
     }
   }
 }
@@ -53,7 +55,9 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
       "args": ["/path/to/limbiq/mcp-server/server.py"],
       "env": {
         "LIMBIQ_USER_ID": "your_name",
-        "LIMBIQ_STORE_PATH": "/path/to/your/neuro_data"
+        "LIMBIQ_STORE_PATH": "/path/to/your/neuro_data",
+        "LIMBIQ_LLM_URL": "http://localhost:11434/v1",
+        "LIMBIQ_LLM_MODEL": "llama3.1"
       }
     }
   }
@@ -66,6 +70,14 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 |----------|---------|-------------|
 | `LIMBIQ_STORE_PATH` | `~/.limbiq/data` | Directory for SQLite + FAISS data |
 | `LIMBIQ_USER_ID` | `jan_user` | User identifier for memory isolation |
+| `LIMBIQ_LLM_URL` | _(none)_ | OpenAI-compatible API URL (e.g. `http://localhost:11434/v1` for Ollama) |
+| `LIMBIQ_LLM_MODEL` | _(none)_ | Model name (e.g. `llama3.1`, `gemma2`) |
+
+When `LIMBIQ_LLM_URL` and `LIMBIQ_LLM_MODEL` are set, Limbiq uses the LLM for:
+- Serotonin pattern analysis and rule crystallization
+- Acetylcholine topic detection
+- Entity extraction tie-breaking for ambiguous fragments
+- Deep batch entity extraction at end of session
 
 ### 4. Use it
 

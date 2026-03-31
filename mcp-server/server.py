@@ -39,8 +39,37 @@ from limbiq import Limbiq
 
 STORE_PATH = os.environ.get("LIMBIQ_STORE_PATH", os.path.join(os.path.expanduser("~"), ".limbiq", "data"))
 USER_ID = os.environ.get("LIMBIQ_USER_ID", "jan_user")
+LLM_URL = os.environ.get("LIMBIQ_LLM_URL", "")  # e.g. http://localhost:11434/v1
+LLM_MODEL = os.environ.get("LIMBIQ_LLM_MODEL", "")  # e.g. llama3.1
 
-lq = Limbiq(store_path=STORE_PATH, user_id=USER_ID)
+
+def _make_llm_fn():
+    """Create an llm_fn callable from Ollama/OpenAI-compatible endpoint."""
+    if not LLM_URL or not LLM_MODEL:
+        return None
+    try:
+        import httpx
+        client = httpx.Client(timeout=30.0)
+
+        def llm_fn(prompt: str) -> str:
+            resp = client.post(
+                f"{LLM_URL}/chat/completions",
+                json={
+                    "model": LLM_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1,
+                    "max_tokens": 256,
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+
+        return llm_fn
+    except Exception:
+        return None
+
+
+lq = Limbiq(store_path=STORE_PATH, user_id=USER_ID, llm_fn=_make_llm_fn())
 lq.start_session()
 
 mcp = FastMCP("limbiq-memory")
